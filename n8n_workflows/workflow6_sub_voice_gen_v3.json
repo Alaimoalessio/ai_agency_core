@@ -1,0 +1,644 @@
+{
+  "name": "SUB — Voice Generation v2",
+  "nodes": [
+    {
+      "id": "trigger-workflow",
+      "name": "Trigger (chiamato da parent)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "node-valida-voice-id",
+      "name": "Valida voice_id",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-voice",
+              "leftValue": "={{ $json.elevenlabs_voice_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "notes": "FIX: previene chiamata a /v1/text-to-speech/undefined se il personaggio non ha voice_id"
+    },
+    {
+      "id": "node-skip-no-voice",
+      "name": "Skip — Nessun voice_id",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        940,
+        450
+      ],
+      "parameters": {
+        "mode": "keepAllCurrentValues",
+        "fields": {
+          "values": [
+            {
+              "name": "audio_url",
+              "type": "string",
+              "value": ""
+            },
+            {
+              "name": "audio_skipped",
+              "type": "boolean",
+              "booleanValue": true
+            },
+            {
+              "name": "skip_reason",
+              "type": "string",
+              "value": "elevenlabs_voice_id non configurato per questo personaggio"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "node-elevenlabs",
+      "name": "ElevenLabs — Generate TTS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        940,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.elevenlabs.io/v1/text-to-speech/{{ $json.elevenlabs_voice_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "xi-api-key",
+              "value": "={{ $env.ELEVENLABS_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "audio/mpeg"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": {{ JSON.stringify($json.text_to_speak) }},\n  \"model_id\": \"eleven_multilingual_v2\",\n  \"voice_settings\": {\n    \"stability\": 0.5,\n    \"similarity_boost\": 0.75\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          },
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "node-prepara-filename",
+      "name": "Prepara Filename",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        200
+      ],
+      "parameters": {
+        "jsCode": "const prev = $('Trigger (chiamato da parent)').item.json;\nconst imageId = prev.image_id || 'unknown';\nconst filename = `voice_${imageId}_${Date.now()}.mp3`;\n\n// Rinomina il binary mantenendolo\nconst bin = $input.item.binary;\nif (bin?.data) {\n  bin.data.fileName = filename;\n  bin.data.mimeType = 'audio/mpeg';\n}\n\nreturn {\n  json: { ...prev, audio_filename: filename },\n  binary: bin\n};"
+      }
+    },
+    {
+      "id": "node-upload-storage",
+      "name": "Supabase Storage — Upload Audio",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1380,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/storage/v1/object/audio-assets/{{ $json.audio_filename }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "audio/mpeg"
+            },
+            {
+              "name": "x-upsert",
+              "value": "true"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "notes": "FIX CRITICO: rimosso multipart-form-data e bodyParameters vuoti. Ora usa contentType=binaryData con inputDataFieldName='data' — l'unico modo corretto per uploadare binary su Supabase Storage da n8n."
+    },
+    {
+      "id": "node-verifica-upload",
+      "name": "Upload OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-upload",
+              "leftValue": "={{ $json.error }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "empty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "node-db-update",
+      "name": "DB: Salva audio_url su images",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1820,
+        150
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images?id=eq.{{ $json.image_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"audio_url\": {{ JSON.stringify($env.SUPABASE_URL + '/storage/v1/object/public/audio-assets/' + $json.audio_filename) }}\n}",
+        "options": {
+          "timeout": 10000
+        }
+      }
+    },
+    {
+      "id": "node-output-success",
+      "name": "Output: Audio URL",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        2040,
+        150
+      ],
+      "parameters": {
+        "mode": "keepAllCurrentValues",
+        "fields": {
+          "values": [
+            {
+              "name": "audio_url",
+              "type": "string",
+              "value": "={{ $env.SUPABASE_URL }}/storage/v1/object/public/audio-assets/{{ $json.audio_filename }}"
+            },
+            {
+              "name": "audio_skipped",
+              "type": "boolean",
+              "booleanValue": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "node-upload-failed",
+      "name": "Output: Upload Fallito",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        1820,
+        300
+      ],
+      "parameters": {
+        "mode": "keepAllCurrentValues",
+        "fields": {
+          "values": [
+            {
+              "name": "audio_url",
+              "type": "string",
+              "value": ""
+            },
+            {
+              "name": "audio_skipped",
+              "type": "boolean",
+              "booleanValue": true
+            },
+            {
+              "name": "skip_reason",
+              "type": "string",
+              "value": "=Upload Supabase fallito: {{ $json.error || $json.message || 'errore sconosciuto' }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "node-gate-audio",
+      "name": "Audio richiesto?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-audio-flag",
+              "leftValue": "={{ $json.generate_audio }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "notes": "THROTTLING: Controlla il flag generate_audio passato dal workflow parent. Se false, salta senza errori."
+    },
+    {
+      "id": "node-skip-audio-flag",
+      "name": "Skip — Audio non richiesto",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        440,
+        480
+      ],
+      "parameters": {
+        "mode": "keepAllCurrentValues",
+        "fields": {
+          "values": [
+            {
+              "name": "audio_url",
+              "type": "string",
+              "value": ""
+            },
+            {
+              "name": "audio_skipped",
+              "type": "boolean",
+              "booleanValue": true
+            },
+            {
+              "name": "skip_reason",
+              "type": "string",
+              "value": "generate_audio=false per questa voce del calendario"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "node-check-audio-throttle",
+      "name": "Controlla Audio in Corso",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        440,
+        200
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "select",
+              "value": "id"
+            },
+            {
+              "name": "character_id",
+              "value": "=eq.{{ $json.character_id }}"
+            },
+            {
+              "name": "audio_url",
+              "value": "=is.null"
+            },
+            {
+              "name": "status",
+              "value": "=eq.approved"
+            },
+            {
+              "name": "limit",
+              "value": "5"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "notes": "Conta immagini approvate senza audio ancora generato per questo personaggio."
+    },
+    {
+      "id": "node-throttle-audio-ok",
+      "name": "Slot audio disponibile?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        200
+      ],
+      "parameters": {
+        "jsCode": "const response = $input.item.json;\nconst prev = $('Trigger (chiamato da parent)').item.json;\n\n// Limite: max 3 richieste audio in coda per personaggio\n// (ElevenLabs ha rate limit aggressivi sul piano Starter)\nconst pending = Array.isArray(response) ? response.length : 0;\nconst MAX_AUDIO_QUEUE = 3;\nconst canProceed = pending < MAX_AUDIO_QUEUE;\n\nreturn {\n  ...prev,\n  audio_pending_count: pending,\n  can_proceed_audio: canProceed,\n  throttle_reason: canProceed\n    ? null\n    : `${pending} audio già in coda per questo personaggio (max ${MAX_AUDIO_QUEUE})`\n};"
+      }
+    },
+    {
+      "id": "node-gate-audio-throttle",
+      "name": "Procedi con audio?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        880,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-audio-throttle",
+              "leftValue": "={{ $json.can_proceed_audio }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "node-skip-throttled-audio",
+      "name": "Skip — Troppi audio in coda",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        1100,
+        400
+      ],
+      "parameters": {
+        "mode": "keepAllCurrentValues",
+        "fields": {
+          "values": [
+            {
+              "name": "audio_url",
+              "type": "string",
+              "value": ""
+            },
+            {
+              "name": "audio_skipped",
+              "type": "boolean",
+              "booleanValue": true
+            },
+            {
+              "name": "skip_reason",
+              "type": "string",
+              "value": "=Throttled: {{ $json.throttle_reason }}"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Trigger (chiamato da parent)": {
+      "main": [
+        [
+          {
+            "node": "Audio richiesto?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valida voice_id": {
+      "main": [
+        [
+          {
+            "node": "ElevenLabs — Generate TTS",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip — Nessun voice_id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ElevenLabs — Generate TTS": {
+      "main": [
+        [
+          {
+            "node": "Prepara Filename",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepara Filename": {
+      "main": [
+        [
+          {
+            "node": "Supabase Storage — Upload Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase Storage — Upload Audio": {
+      "main": [
+        [
+          {
+            "node": "Upload OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload OK?": {
+      "main": [
+        [
+          {
+            "node": "DB: Salva audio_url su images",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Output: Upload Fallito",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB: Salva audio_url su images": {
+      "main": [
+        [
+          {
+            "node": "Output: Audio URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audio richiesto?": {
+      "main": [
+        [
+          {
+            "node": "Controlla Audio in Corso",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip — Audio non richiesto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Controlla Audio in Corso": {
+      "main": [
+        [
+          {
+            "node": "Slot audio disponibile?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot audio disponibile?": {
+      "main": [
+        [
+          {
+            "node": "Procedi con audio?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Procedi con audio?": {
+      "main": [
+        [
+          {
+            "node": "Valida voice_id",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip — Troppi audio in coda",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    {
+      "name": "sub-workflow"
+    },
+    {
+      "name": "audio"
+    }
+  ],
+  "notes": "v3 — AGGIUNTO THROTTLING: (1) Gate su generate_audio flag dal parent (2) Max 3 audio in coda per personaggio (ElevenLabs rate limit) (3) Tutti i path di skip ritornano audio_skipped=true al parent senza errori fatali"
+}

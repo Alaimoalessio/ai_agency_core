@@ -1,0 +1,769 @@
+{
+  "name": "Workflow 1 — Generazione Immagine AI (LoRA) v4 — Quality + Selector",
+  "nodes": [
+
+    {
+      "parameters": {
+        "updates": ["message", "callback_query"],
+        "additionalFields": {}
+      },
+      "id": "node-001",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 400],
+      "webhookId": "telegram-webhook-001",
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const incoming = $input.item.json;\nconst chatId = incoming?.message?.chat?.id || incoming?.callback_query?.message?.chat?.id || null;\nif (!chatId) return { authorized: false, chat_id: null };\nreturn { chat_id: chatId };"
+      },
+      "id": "node-auth-extract",
+      "name": "Estrai Chat ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/team_members",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          { "name": "telegram_chat_id", "value": "=eq.{{ $json.chat_id }}" },
+          { "name": "is_active", "value": "eq.true" },
+          { "name": "select", "value": "id,name,role,telegram_chat_id" }
+        ]},
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-auth-db",
+      "name": "Cerca Membro in DB",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 400]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const members = $input.item.json;\nconst chatId = $('Estrai Chat ID').item.json.chat_id;\nif (!Array.isArray(members) || members.length === 0) {\n  return { authorized: false, chat_id: chatId, role: null, member_id: null, member_name: null };\n}\nconst m = members[0];\nreturn { authorized: true, chat_id: chatId, role: m.role, member_id: m.id, member_name: m.name };"
+      },
+      "id": "node-auth-check-result",
+      "name": "Valida Membro",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 400]
+    },
+
+    {
+      "parameters": {
+        "conditions": { "conditions": [{ "id": "cond-auth", "leftValue": "={{ $json.authorized }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }], "combinator": "and" }
+      },
+      "id": "node-auth-gate",
+      "name": "Autorizzato?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 400]
+    },
+
+    {
+      "parameters": {
+        "conditions": { "conditions": [{ "id": "cond-cb", "leftValue": "={{ $('Telegram Trigger').item.json.callback_query }}", "rightValue": "", "operator": { "type": "object", "operation": "exists", "singleValue": true } }], "combinator": "and" }
+      },
+      "id": "node-020",
+      "name": "È un callback?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1340, 400]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// ================================================================\n// CALLBACK HANDLER v4\n// Gestisce: APPROVE, DISCARD, REGEN, CHARACTER_SELECT\n// ================================================================\nconst callback = $('Telegram Trigger').item.json.callback_query;\nconst data = callback.data;\nconst chatId = callback.message.chat.id;\nconst messageId = callback.message.message_id;\nconst member = $('Valida Membro').item.json;\n\nlet action = 'unknown';\nlet shortId = '';\nlet characterId = '';\n\nif (data === 'DISCARD') {\n  action = 'discard';\n} else if (data.startsWith('APPROVE::')) {\n  action = 'approve';\n  shortId = data.replace('APPROVE::', '');\n  if (!['admin', 'approver'].includes(member.role)) action = 'unauthorized_action';\n} else if (data.startsWith('REGEN::')) {\n  action = 'regen';\n  shortId = data.replace('REGEN::', '');\n} else if (data.startsWith('CHAR::')) {\n  // NEW: selezione personaggio via inline keyboard\n  action = 'character_select';\n  characterId = data.replace('CHAR::', '');\n}\n\nreturn { action, short_id: shortId, character_id: characterId, chat_id: chatId, message_id: messageId, member_id: member.member_id, member_name: member.member_name, role: member.role };"
+      },
+      "id": "node-021",
+      "name": "Elabora Callback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 220]
+    },
+
+    {
+      "parameters": {
+        "rules": {
+          "rules": [
+            { "outputKey": "image_action", "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "character_select", "operator": { "type": "string", "operation": "notEquals" } }], "combinator": "and" } },
+            { "outputKey": "char_select", "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "character_select", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } }
+          ]
+        }
+      },
+      "id": "node-callback-type-router",
+      "name": "Tipo di Callback?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1780, 220]
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          { "name": "short_id", "value": "=eq.{{ $json.short_id }}" },
+          { "name": "select", "value": "id,short_id,image_url,user_request,character_id,prompt,lora_scale" }
+        ]},
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-fetch-image-record",
+      "name": "Recupera Record Immagine",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 140]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const records = $input.item.json;\nconst cb = $('Elabora Callback').item.json;\nif (!Array.isArray(records) || records.length === 0) return { ...cb, image_record: null, error: 'Record non trovato' };\nconst rec = records[0];\nreturn { ...cb, image_id: rec.id, image_url: rec.image_url, user_request: rec.user_request, character_id: rec.character_id, prompt: rec.prompt, lora_scale: rec.lora_scale };"
+      },
+      "id": "node-merge-callback",
+      "name": "Unisci Dati Callback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 140]
+    },
+
+    {
+      "parameters": {
+        "rules": {
+          "rules": [
+            { "outputKey": "approve", "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "approve", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } },
+            { "outputKey": "regen", "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "regen", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } },
+            { "outputKey": "discard", "conditions": { "conditions": [{ "leftValue": "={{ $json.action }}", "rightValue": "discard", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } }
+          ]
+        }
+      },
+      "id": "node-action-router",
+      "name": "Router Azione",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [2440, 140]
+    },
+
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" },
+          { "name": "Prefer", "value": "return=minimal" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "id", "value": "=eq.{{ $json.image_id }}" }] },
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\"status\": \"approved\", \"approved_by\": \"{{ $json.member_id }}\"}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-db-approve",
+      "name": "DB: Segna Approvata",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2660, 60]
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $('Unisci Dati Callback').item.json.chat_id }}",
+        "text": "=✅ Immagine approvata! Pronta per la pubblicazione.\n🔗 {{ $('Unisci Dati Callback').item.json.image_url }}",
+        "additionalFields": {}
+      },
+      "id": "node-023",
+      "name": "Conferma Approvazione",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2880, 60],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "id", "value": "=eq.{{ $json.image_id }}" }] },
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\"status\": \"discarded\"}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-db-discard",
+      "name": "DB: Segna Scartata",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2660, 220]
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $('Unisci Dati Callback').item.json.chat_id }}",
+        "text": "🗑 Immagine scartata. Inviami una nuova descrizione per rigenerare!",
+        "additionalFields": {}
+      },
+      "id": "node-024",
+      "name": "Conferma Scarto",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2880, 220],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $('Unisci Dati Callback').item.json.chat_id }}",
+        "text": "=🔄 Rigenero la scena...\n\n📝 {{ $('Unisci Dati Callback').item.json.user_request }}",
+        "additionalFields": {}
+      },
+      "id": "node-regen-msg",
+      "name": "Messaggio Rigenerazione",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2660, 140],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "conditions": { "conditions": [{ "id": "cond-text", "leftValue": "={{ $('Telegram Trigger').item.json.message.text }}", "rightValue": "", "operator": { "type": "string", "operation": "exists", "singleValue": true } }], "combinator": "and" }
+      },
+      "id": "node-002",
+      "name": "È un testo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1560, 580]
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/characters",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          { "name": "is_active", "value": "eq.true" },
+          { "name": "select", "value": "id,name,trigger_word,lora_model,lora_version,lora_scale,age,hair,eyes,body,ethnicity,style,distinctive,content_pillars" }
+        ]},
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-fetch-characters",
+      "name": "Carica Personaggi da DB",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 580]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// ================================================================\n// CHARACTER SELECTOR v4\n// Se c'è UN solo personaggio → va diretto alla generazione.\n// Se ce ne sono PIÙ di uno → mostra inline keyboard con la scelta.\n// Se arriva da CHAR:: callback → usa il personaggio selezionato.\n// Se arriva da REGEN → usa character_id del record originale.\n// ================================================================\nconst characters = $input.item.json;\nconst member = $('Valida Membro').item.json;\nconst trigger = $('Telegram Trigger').item.json;\n\nif (!Array.isArray(characters) || characters.length === 0) {\n  throw new Error('Nessun personaggio attivo nel database.');\n}\n\nlet userRequest = '';\nlet chatId = member.chat_id;\nlet selectedCharId = null;\n\n// Caso 1: callback CHAR:: (utente ha appena scelto il personaggio)\nif (trigger.callback_query && $('Elabora Callback').item.json.action === 'character_select') {\n  selectedCharId = $('Elabora Callback').item.json.character_id;\n  // La user_request è stata salvata come caption del messaggio precedente\n  // la recuperiamo dal testo del messaggio originale nel callback\n  userRequest = trigger.callback_query.message.caption || trigger.callback_query.message.text || '';\n  // Pulizia: rimuovi la riga \"Scegli il personaggio:\" se presente\n  userRequest = userRequest.replace(/^🎭.*\\n\\n?/m, '').trim();\n}\n// Caso 2: REGEN (usa il personaggio dell'immagine originale)\nelse if (trigger.callback_query && $('Elabora Callback').item.json.action === 'regen') {\n  selectedCharId = $('Unisci Dati Callback').item.json.character_id;\n  userRequest = $('Unisci Dati Callback').item.json.user_request;\n}\n// Caso 3: messaggio di testo normale\nelse {\n  userRequest = trigger.message.text || '';\n}\n\n// Se un solo personaggio attivo → scegli automaticamente\nif (characters.length === 1) {\n  selectedCharId = characters[0].id;\n}\n\n// Se non è ancora stato selezionato → segnala per mostrare keyboard\nif (!selectedCharId) {\n  return {\n    show_character_selector: true,\n    characters: characters.map(c => ({ id: c.id, name: c.name })),\n    user_request: userRequest,\n    chat_id: chatId,\n    member_id: member.member_id,\n    member_name: member.member_name\n  };\n}\n\n// Trova il personaggio selezionato\nconst char = characters.find(c => c.id === selectedCharId) || characters[0];\n\nconst characterSheet = [\n  `${char.trigger_word} woman`,\n  char.age,\n  char.ethnicity,\n  char.hair,\n  char.eyes,\n  char.body,\n  char.style,\n  char.distinctive,\n  'consistent appearance',\n  'same person'\n].filter(Boolean).join(', ');\n\nreturn {\n  show_character_selector: false,\n  character_id: char.id,\n  character_sheet: characterSheet,\n  character_name: char.name,\n  trigger_word: char.trigger_word,\n  lora_model: char.lora_model,\n  lora_version: char.lora_version,\n  lora_scale: char.lora_scale,\n  content_pillars: char.content_pillars || [],\n  user_request: userRequest,\n  chat_id: chatId,\n  member_id: member.member_id,\n  member_name: member.member_name\n};"
+      },
+      "id": "node-character-selector",
+      "name": "Seleziona Personaggio",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 580]
+    },
+
+    {
+      "parameters": {
+        "conditions": { "conditions": [{ "id": "cond-show-selector", "leftValue": "={{ $json.show_character_selector }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }], "combinator": "and" }
+      },
+      "id": "node-needs-selection",
+      "name": "Mostrare Selezione?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2220, 580]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Costruisce dinamicamente l'inline keyboard con i personaggi disponibili\nconst data = $input.item.json;\nconst chars = data.characters;\n\n// Crea i bottoni (max 2 per riga per leggibilità)\nconst rows = [];\nfor (let i = 0; i < chars.length; i += 2) {\n  const buttons = [{ text: `🎭 ${chars[i].name}`, callback_data: `CHAR::${chars[i].id}` }];\n  if (chars[i + 1]) buttons.push({ text: `🎭 ${chars[i + 1].name}`, callback_data: `CHAR::${chars[i + 1].id}` });\n  rows.push({ inline_keyboard: [buttons] });\n}\n\nreturn {\n  chat_id: data.chat_id,\n  user_request: data.user_request,\n  keyboard_json: JSON.stringify({ inline_keyboard: rows.flatMap(r => r.inline_keyboard) })\n};"
+      },
+      "id": "node-build-keyboard",
+      "name": "Costruisci Keyboard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 480]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Content-Type", "value": "application/json" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": {{ $json.chat_id }},\n  \"text\": \"🎭 Scegli il personaggio per questa scena:\\n\\n_{{ $json.user_request }}_\",\n  \"parse_mode\": \"Markdown\",\n  \"reply_markup\": {{ $json.keyboard_json }}\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-send-selector",
+      "name": "Invia Selezione Personaggio",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2660, 480]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" },
+          { "name": "Prefer", "value": "return=representation" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"character_id\": \"{{ $json.character_id }}\",\n  \"generated_by\": \"{{ $json.member_id }}\",\n  \"user_request\": {{ JSON.stringify($json.user_request) }},\n  \"status\": \"generating\",\n  \"lora_scale\": {{ $json.lora_scale }},\n  \"attempts\": 1\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-db-create-image",
+      "name": "DB: Crea Record Immagine",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 680]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const dbResponse = $input.item.json;\nconst sheet = $('Seleziona Personaggio').item.json;\nconst record = Array.isArray(dbResponse) ? dbResponse[0] : dbResponse;\nreturn { ...sheet, image_id: record.id, short_id: record.short_id, generation_start: Date.now(), attempt: 1 };"
+      },
+      "id": "node-extract-record-id",
+      "name": "Estrai ID Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 680]
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "=⏳ Sto generando l'immagine di {{ $json.character_name }}...\n\n🎨 Scena: {{ $json.user_request }}\n\n_Ci vogliono circa 30-60 secondi._",
+        "additionalFields": { "parseMode": "Markdown" }
+      },
+      "id": "node-004",
+      "name": "Invia messaggio attesa",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2880, 680],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{ $env.OPENROUTER_API_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"anthropic/claude-sonnet-4-5\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are an expert prompt engineer for FLUX image generation with LoRA fine-tuned models. Create highly detailed, photorealistic prompts for a consistent AI character.\\n\\nCONTENT PILLARS:\\n{{ $('Seleziona Personaggio').item.json.content_pillars.length > 0 ? JSON.stringify($('Seleziona Personaggio').item.json.content_pillars) : '[{\\\"name\\\":\\\"lifestyle\\\",\\\"style\\\":\\\"bright natural light, candid\\\"},{\\\"name\\\":\\\"glam\\\",\\\"style\\\":\\\"dramatic cinematic lighting, luxury setting\\\"}]' }}\\n\\nRULES:\\n1. Trigger word + character description FIRST, VERBATIM.\\n2. English only. Raw JSON only: {\\\"prompt\\\":\\\"...\\\",\\\"negative_prompt\\\":\\\"...\\\",\\\"pillar\\\":\\\"...\\\"}\\n3. Choose best content pillar. Apply its style.\\n4. Quality tags: photorealistic, 8k uhd, professional photography, sharp focus, cinematic lighting, shot on Sony A7IV.\\n5. NEVER alter physical traits. NEVER add people unless asked.\\n6. negative_prompt always: different person, inconsistent face, bad anatomy, bad hands, text, watermark, blurry, deformed, ugly, mutation, extra limbs, low quality.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Character (VERBATIM first): {{ $('Seleziona Personaggio').item.json.character_sheet }}\\n\\nScene: {{ $('Seleziona Personaggio').item.json.user_request.replace(/\\\"/g, '\\\\\\\"') }}\"\n    }\n  ],\n  \"temperature\": 0.4,\n  \"max_tokens\": 1024\n}",
+        "options": { "timeout": 60000 }
+      },
+      "id": "node-005",
+      "name": "Claude — Ottimizza Prompt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3100, 680]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const response = $input.item.json;\nconst sheet = $('Estrai ID Record').item.json;\nif (!response.choices?.[0]) throw new Error('Risposta Claude non valida');\nconst raw = response.choices[0].message.content;\nconst cleaned = raw.replace(/```json\\s*/gi,'').replace(/```\\s*/g,'').trim();\nconst match = cleaned.match(/\\{[\\s\\S]*\\}/);\nconst DEFAULT_NEG = 'different person, inconsistent face, bad anatomy, bad hands, text, watermark, blurry, deformed, ugly, mutation, extra limbs, low quality';\nlet parsed;\ntry { parsed = JSON.parse(match ? match[0] : cleaned); } catch(e) { parsed = { prompt: cleaned, negative_prompt: DEFAULT_NEG, pillar: 'lifestyle' }; }\nlet prompt = (parsed.prompt || '').trim();\nif (!prompt.toLowerCase().includes(sheet.trigger_word.toLowerCase())) prompt = `${sheet.trigger_word} woman, ${prompt}`;\nreturn { ...sheet, prompt, negative_prompt: (parsed.negative_prompt || DEFAULT_NEG).trim(), content_pillar: parsed.pillar || 'lifestyle' };"
+      },
+      "id": "node-006",
+      "name": "Elabora Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3320, 680]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.replicate.com/v1/predictions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Token {{ $env.REPLICATE_API_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" },
+          { "name": "Prefer", "value": "wait" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"version\": {{ JSON.stringify($json.lora_version) }},\n  \"input\": {\n    \"prompt\": {{ JSON.stringify($json.prompt) }},\n    \"negative_prompt\": {{ JSON.stringify($json.negative_prompt) }},\n    \"width\": 1024,\n    \"height\": 1280,\n    \"num_inference_steps\": 40,\n    \"guidance_scale\": 3.2,\n    \"lora_scale\": {{ $json.lora_scale }},\n    \"num_outputs\": 1,\n    \"output_format\": \"jpeg\",\n    \"output_quality\": 90\n  }\n}",
+        "options": { "timeout": 180000 }
+      },
+      "id": "node-007",
+      "name": "FLUX + LoRA — Genera Immagine",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3540, 680]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const rep = $input.item.json;\nconst prev = $('Elabora Prompt').item.json;\nlet imageUrl = rep.output ? (Array.isArray(rep.output) ? rep.output[0] : rep.output) : null;\nif (!imageUrl) throw new Error('Nessuna immagine. Status: ' + (rep.status||'?') + ' Error: ' + (rep.error||'?'));\nreturn { ...prev, image_url: imageUrl, generation_time_ms: Date.now() - (prev.generation_start || Date.now()) };"
+      },
+      "id": "node-008",
+      "name": "Estrai URL Immagine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3760, 680]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{ $env.OPENROUTER_API_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"anthropic/claude-opus-4-6\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\n          \"type\": \"image\",\n          \"source\": { \"type\": \"url\", \"url\": {{ JSON.stringify($json.image_url) }} }\n        },\n        {\n          \"type\": \"text\",\n          \"text\": \"You are a quality control system for AI-generated social media images. Analyze this image strictly and objectively.\\n\\nExpected trigger word in prompt: {{ $json.trigger_word }}\\nPrompt used: {{ $json.prompt.substring(0, 300) }}\\n\\nCheck ALL of the following:\\n1. FACE: Is the face clearly visible, realistic, and non-deformed? (no melting, distortion, multiple faces)\\n2. HANDS: Are hands natural? (correct number of fingers, no extra/missing fingers)\\n3. ANATOMY: Is body anatomy correct? (no extra limbs, no floating body parts)\\n4. BLUR: Is the main subject in sharp focus?\\n5. COMPOSITION: Is the image properly framed? (subject not cut off awkwardly)\\n6. ARTIFACTS: Are there visible AI artifacts, watermarks, or text?\\n7. CONSISTENCY: Does the image match the scene described?\\n\\nRespond ONLY with raw JSON (no markdown):\\n{\\n  \\\"pass\\\": true/false,\\n  \\\"score\\\": 0-100,\\n  \\\"issues\\\": [\\\"list of specific problems found, empty if none\\\"],\\n  \\\"verdict\\\": \\\"one sentence summary\\\"\\n}\\n\\nBe strict: score below 70 = fail. Common failures: deformed face, wrong finger count, blurry subject, heavy artifacts.\"\n        }\n      ]\n    }\n  ],\n  \"max_tokens\": 512\n}",
+        "options": { "timeout": 60000 }
+      },
+      "id": "node-quality-validator",
+      "name": "Claude Vision — Valida Qualità",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3980, 680]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// ================================================================\n// QUALITY CHECK PARSER\n// Legge la risposta di Claude Vision e decide se passare o rigenerare\n// ================================================================\nconst visionResponse = $input.item.json;\nconst prev = $('Estrai URL Immagine').item.json;\n\nif (!visionResponse.choices?.[0]) {\n  // Se Claude Vision fallisce, lascia passare (meglio preview che blocco)\n  return { ...prev, quality_pass: true, quality_score: null, quality_issues: [], quality_verdict: 'Validazione non disponibile' };\n}\n\nconst raw = visionResponse.choices[0].message.content;\nconst cleaned = raw.replace(/```json\\s*/gi,'').replace(/```\\s*/g,'').trim();\nconst match = cleaned.match(/\\{[\\s\\S]*\\}/);\n\nlet qc;\ntry {\n  qc = JSON.parse(match ? match[0] : cleaned);\n} catch(e) {\n  return { ...prev, quality_pass: true, quality_score: null, quality_issues: [], quality_verdict: 'Parse error — lasciata passare' };\n}\n\nconst pass = qc.pass === true && (qc.score || 0) >= 70;\n\nreturn {\n  ...prev,\n  quality_pass: pass,\n  quality_score: qc.score || 0,\n  quality_issues: qc.issues || [],\n  quality_verdict: qc.verdict || ''\n};"
+      },
+      "id": "node-quality-parser",
+      "name": "Elabora Risultato Qualità",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4200, 680]
+    },
+
+    {
+      "parameters": {
+        "conditions": { "conditions": [{ "id": "cond-quality", "leftValue": "={{ $json.quality_pass }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }], "combinator": "and" }
+      },
+      "id": "node-quality-gate",
+      "name": "Qualità OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [4420, 680]
+    },
+
+    {
+      "parameters": {
+        "conditions": { "conditions": [{ "id": "cond-attempts", "leftValue": "={{ $json.attempt }}", "rightValue": 2, "operator": { "type": "number", "operation": "lt" } }], "combinator": "and" }
+      },
+      "id": "node-retry-check",
+      "name": "Tentativi < 2?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [4640, 820]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Prepara il secondo tentativo incrementando il contatore\nconst prev = $input.item.json;\nreturn {\n  ...prev,\n  attempt: (prev.attempt || 1) + 1,\n  generation_start: Date.now()\n};"
+      },
+      "id": "node-prepare-retry",
+      "name": "Prepara Retry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4860, 760]
+    },
+
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "id", "value": "=eq.{{ $json.image_id }}" }] },
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"quality_score\": {{ $json.quality_score || 0 }},\n  \"quality_issues\": {{ JSON.stringify($json.quality_issues || []) }},\n  \"status\": \"failed\",\n  \"error_message\": {{ JSON.stringify('Quality check failed after 2 attempts: ' + ($json.quality_verdict || '')) }}\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-db-quality-fail",
+      "name": "DB: Segna Quality Fail",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4860, 900]
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $('Seleziona Personaggio').item.json.chat_id }}",
+        "text": "=⚠️ L'immagine non ha superato il controllo qualità dopo 2 tentativi.\n\n🔍 Problema rilevato: {{ $json.quality_verdict }}\n\nProva a riformulare la descrizione della scena.",
+        "additionalFields": {}
+      },
+      "id": "node-quality-fail-msg",
+      "name": "Messaggio Quality Fail",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [5080, 900],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "id", "value": "=eq.{{ $json.image_id }}" }] },
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"status\": \"pending\",\n  \"image_url\": {{ JSON.stringify($json.image_url) }},\n  \"prompt\": {{ JSON.stringify($json.prompt) }},\n  \"negative_prompt\": {{ JSON.stringify($json.negative_prompt) }},\n  \"content_pillar\": {{ JSON.stringify($json.content_pillar) }},\n  \"quality_score\": {{ $json.quality_score || 0 }},\n  \"quality_issues\": {{ JSON.stringify($json.quality_issues || []) }},\n  \"generation_time_ms\": {{ $json.generation_time_ms }},\n  \"attempts\": {{ $json.attempt || 1 }}\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-db-update-pending",
+      "name": "DB: Aggiorna a Pending",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4640, 580]
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Estrai URL Immagine').item.json.image_url }}",
+        "options": { "response": { "response": { "responseFormat": "file" } } }
+      },
+      "id": "node-009",
+      "name": "Scarica Immagine",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4860, 580]
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $('Estrai URL Immagine').item.json.chat_id }}",
+        "binaryData": true,
+        "binaryPropertyName": "data",
+        "additionalFields": {
+          "caption": "=👁 *Preview* — {{ $('Estrai URL Immagine').item.json.character_name }}\n\n📝 {{ $('Estrai URL Immagine').item.json.user_request }}\n🎨 Pillar: {{ $('Estrai URL Immagine').item.json.content_pillar }}\n✅ Quality score: {{ $('Elabora Risultato Qualità').item.json.quality_score }}/100\n⚡ Generata in {{ Math.round($('Estrai URL Immagine').item.json.generation_time_ms / 1000) }}s\n\nVuoi pubblicarla?",
+          "replyMarkup": "inlineKeyboard",
+          "inlineKeyboard": {
+            "rows": [{
+              "row": {
+                "buttons": [
+                  { "text": "✅ Approva", "callbackData": "={{ 'APPROVE::' + $('Estrai URL Immagine').item.json.short_id }}" },
+                  { "text": "🔄 Rigenera", "callbackData": "={{ 'REGEN::' + $('Estrai URL Immagine').item.json.short_id }}" },
+                  { "text": "❌ Scarta", "callbackData": "DISCARD" }
+                ]
+              }
+            }]
+          }
+        }
+      },
+      "id": "node-010",
+      "name": "Invia Preview con Approvazione",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [5080, 580],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $('Telegram Trigger').item.json.message?.chat?.id || $('Valida Membro').item.json.chat_id }}",
+        "text": "❌ Puoi inviarmi solo messaggi di testo. Descrivi la scena che vuoi generare.",
+        "additionalFields": {}
+      },
+      "id": "node-011",
+      "name": "Errore — non è testo",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1780, 720],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $('Seleziona Personaggio').item.json.chat_id }}",
+        "text": "❌ Errore generazione. Riprova tra qualche momento.",
+        "additionalFields": {}
+      },
+      "id": "node-012",
+      "name": "Errore — generazione fallita",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [3760, 880],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $('Seleziona Personaggio').item.json.chat_id }}",
+        "text": "❌ Errore Claude. Riprova tra qualche momento.",
+        "additionalFields": {}
+      },
+      "id": "node-013",
+      "name": "Errore — Claude fallito",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [3320, 880],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $('Valida Membro').item.json.chat_id }}",
+        "text": "⛔ Non sei autorizzato ad usare questo bot.",
+        "additionalFields": {}
+      },
+      "id": "node-unauthorized",
+      "name": "Non Autorizzato",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1340, 600],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    }
+
+  ],
+
+  "connections": {
+    "Telegram Trigger": { "main": [[{ "node": "Estrai Chat ID", "type": "main", "index": 0 }]] },
+    "Estrai Chat ID": { "main": [[{ "node": "Cerca Membro in DB", "type": "main", "index": 0 }]] },
+    "Cerca Membro in DB": { "main": [[{ "node": "Valida Membro", "type": "main", "index": 0 }]] },
+    "Valida Membro": { "main": [[{ "node": "Autorizzato?", "type": "main", "index": 0 }]] },
+    "Autorizzato?": {
+      "main": [
+        [{ "node": "È un callback?", "type": "main", "index": 0 }],
+        [{ "node": "Non Autorizzato", "type": "main", "index": 0 }]
+      ]
+    },
+    "È un callback?": {
+      "main": [
+        [{ "node": "Elabora Callback", "type": "main", "index": 0 }],
+        [{ "node": "È un testo?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Elabora Callback": { "main": [[{ "node": "Tipo di Callback?", "type": "main", "index": 0 }]] },
+    "Tipo di Callback?": {
+      "main": [
+        [{ "node": "Recupera Record Immagine", "type": "main", "index": 0 }],
+        [{ "node": "Carica Personaggi da DB", "type": "main", "index": 0 }]
+      ]
+    },
+    "Recupera Record Immagine": { "main": [[{ "node": "Unisci Dati Callback", "type": "main", "index": 0 }]] },
+    "Unisci Dati Callback": { "main": [[{ "node": "Router Azione", "type": "main", "index": 0 }]] },
+    "Router Azione": {
+      "main": [
+        [{ "node": "DB: Segna Approvata", "type": "main", "index": 0 }],
+        [{ "node": "Messaggio Rigenerazione", "type": "main", "index": 0 }],
+        [{ "node": "DB: Segna Scartata", "type": "main", "index": 0 }]
+      ]
+    },
+    "DB: Segna Approvata": { "main": [[{ "node": "Conferma Approvazione", "type": "main", "index": 0 }]] },
+    "DB: Segna Scartata": { "main": [[{ "node": "Conferma Scarto", "type": "main", "index": 0 }]] },
+    "Messaggio Rigenerazione": { "main": [[{ "node": "Carica Personaggi da DB", "type": "main", "index": 0 }]] },
+    "È un testo?": {
+      "main": [
+        [{ "node": "Carica Personaggi da DB", "type": "main", "index": 0 }],
+        [{ "node": "Errore — non è testo", "type": "main", "index": 0 }]
+      ]
+    },
+    "Carica Personaggi da DB": { "main": [[{ "node": "Seleziona Personaggio", "type": "main", "index": 0 }]] },
+    "Seleziona Personaggio": { "main": [[{ "node": "Mostrare Selezione?", "type": "main", "index": 0 }]] },
+    "Mostrare Selezione?": {
+      "main": [
+        [{ "node": "DB: Crea Record Immagine", "type": "main", "index": 0 }],
+        [{ "node": "Costruisci Keyboard", "type": "main", "index": 0 }]
+      ]
+    },
+    "Costruisci Keyboard": { "main": [[{ "node": "Invia Selezione Personaggio", "type": "main", "index": 0 }]] },
+    "DB: Crea Record Immagine": { "main": [[{ "node": "Estrai ID Record", "type": "main", "index": 0 }]] },
+    "Estrai ID Record": { "main": [[{ "node": "Invia messaggio attesa", "type": "main", "index": 0 }]] },
+    "Invia messaggio attesa": { "main": [[{ "node": "Claude — Ottimizza Prompt", "type": "main", "index": 0 }]] },
+    "Claude — Ottimizza Prompt": {
+      "main": [[{ "node": "Elabora Prompt", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Errore — Claude fallito", "type": "main", "index": 0 }]]
+    },
+    "Elabora Prompt": { "main": [[{ "node": "FLUX + LoRA — Genera Immagine", "type": "main", "index": 0 }]] },
+    "FLUX + LoRA — Genera Immagine": {
+      "main": [[{ "node": "Estrai URL Immagine", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Errore — generazione fallita", "type": "main", "index": 0 }]]
+    },
+    "Estrai URL Immagine": { "main": [[{ "node": "Claude Vision — Valida Qualità", "type": "main", "index": 0 }]] },
+    "Claude Vision — Valida Qualità": { "main": [[{ "node": "Elabora Risultato Qualità", "type": "main", "index": 0 }]] },
+    "Elabora Risultato Qualità": { "main": [[{ "node": "Qualità OK?", "type": "main", "index": 0 }]] },
+    "Qualità OK?": {
+      "main": [
+        [{ "node": "DB: Aggiorna a Pending", "type": "main", "index": 0 }],
+        [{ "node": "Tentativi < 2?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Tentativi < 2?": {
+      "main": [
+        [{ "node": "Prepara Retry", "type": "main", "index": 0 }],
+        [{ "node": "DB: Segna Quality Fail", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prepara Retry": { "main": [[{ "node": "FLUX + LoRA — Genera Immagine", "type": "main", "index": 0 }]] },
+    "DB: Segna Quality Fail": { "main": [[{ "node": "Messaggio Quality Fail", "type": "main", "index": 0 }]] },
+    "DB: Aggiorna a Pending": { "main": [[{ "node": "Scarica Immagine", "type": "main", "index": 0 }]] },
+    "Scarica Immagine": { "main": [[{ "node": "Invia Preview con Approvazione", "type": "main", "index": 0 }]] }
+  },
+
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["flux", "lora", "telegram", "image-generation", "quality-control", "character-selector", "supabase", "v4"],
+  "triggerCount": 0,
+  "updatedAt": "2026-02-27T00:00:00.000Z",
+  "versionId": "4"
+}

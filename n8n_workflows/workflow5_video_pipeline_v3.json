@@ -1,0 +1,1014 @@
+{
+  "name": "Workflow 5 — Video Automation (Async I2V) v2",
+  "nodes": [
+    {
+      "id": "trigger-supabase",
+      "name": "Supabase Trigger (Image Approved)",
+      "type": "n8n-nodes-base.supabaseTrigger",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        100
+      ],
+      "parameters": {
+        "event": "UPDATE",
+        "table": "images",
+        "condition": "={{ $json.record.status === 'approved' && $json.old_record.status !== 'approved' && $json.record.video_status === 'pending' }}"
+      },
+      "notes": "FIX: video_status='pending' ora esiste nel DB (migration_v5b). Il trigger parte correttamente."
+    },
+    {
+      "id": "node-valida-voice-id",
+      "name": "Carica Dati Personaggio",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1670,
+        100
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/characters",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "select",
+              "value": "id,name,trigger_word,content_pillars"
+            },
+            {
+              "name": "id",
+              "value": "=eq.{{ $json.record.character_id }}"
+            },
+            {
+              "name": "limit",
+              "value": "1"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      }
+    },
+    {
+      "id": "node-prepara-dati",
+      "name": "Prepara Dati Generazione",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        100
+      ],
+      "parameters": {
+        "jsCode": "const trigger = $('Supabase Trigger (Image Approved)').item.json.record;\nconst charData = $input.item.json;\nconst character = Array.isArray(charData) ? charData[0] : charData;\n\nreturn {\n  // Dati immagine dal trigger\n  image_id:        trigger.id,\n  image_url:       trigger.watermarked_url || trigger.stored_url || trigger.image_url,\n  user_request:    trigger.user_request,\n  scene_description: trigger.user_request,\n  content_pillar:  trigger.content_pillar,\n  // Dati personaggio\n  character_id:    trigger.character_id,\n  character_name:  character?.name || 'Unknown',\n  trigger_word:    character?.trigger_word || '',\n};"
+      }
+    },
+    {
+      "id": "node-openrouter-prompt",
+      "name": "Claude — Genera Video Prompt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2190,
+        100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OPENROUTER_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"anthropic/claude-sonnet-4-5\",\n  \"max_tokens\": 150,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"Write a kinetic video prompt for an Image-to-Video AI model.\\nFocus on: subtle motion, slow camera pan, natural lighting changes, hair/fabric movement.\\nMax 2 sentences. Return ONLY the prompt text.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Scene: {{ $json.scene_description }}\\nContent pillar: {{ $json.content_pillar }}\"\n    }\n  ]\n}",
+        "options": {
+          "timeout": 20000
+        }
+      }
+    },
+    {
+      "id": "node-extract-video-prompt",
+      "name": "Estrai Video Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2420,
+        100
+      ],
+      "parameters": {
+        "jsCode": "const response = $input.item.json;\nconst prev = $('Prepara Dati Generazione').item.json;\n\nconst videoPrompt = response.choices?.[0]?.message?.content?.trim()\n  || 'Smooth cinematic pan, subtle natural movement, soft lighting';\n\nreturn { ...prev, video_prompt: videoPrompt };"
+      }
+    },
+    {
+      "id": "node-scegli-provider",
+      "name": "Scegli Provider Video",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        2650,
+        100
+      ],
+      "parameters": {
+        "mode": "expression",
+        "output": "={{ $env.VIDEO_PROVIDER || 'kling' }}",
+        "rules": {
+          "values": [
+            {
+              "outputKey": "kling",
+              "value": "kling"
+            },
+            {
+              "outputKey": "runway",
+              "value": "runway"
+            }
+          ]
+        }
+      },
+      "notes": "Imposta VIDEO_PROVIDER='kling' o 'runway' nelle env vars di n8n"
+    },
+    {
+      "id": "node-kling-api",
+      "name": "Kling v1.5 — Generate Async",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2880,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.klingai.com/v1/videos/image2video",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.KLING_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model_name\": \"kling-v1-5\",\n  \"image\": {{ JSON.stringify($json.image_url) }},\n  \"prompt\": {{ JSON.stringify($json.video_prompt) }},\n  \"duration\": 5,\n  \"aspect_ratio\": \"9:16\",\n  \"cfg_scale\": 0.5,\n  \"callback_url\": \"{{ $env.N8N_WEBHOOK_URL }}/i2v-callback\"\n}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "notes": "API Kling corretta: api.klingai.com/v1/videos/image2video"
+    },
+    {
+      "id": "node-runway-api",
+      "name": "Runway Gen-3 — Generate Async",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2880,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.dev.runwayml.com/v1/image_to_video",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.RUNWAYML_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Runway-Version",
+              "value": "2024-09-13"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gen3a_turbo\",\n  \"promptImage\": {{ JSON.stringify($json.image_url) }},\n  \"promptText\": {{ JSON.stringify($json.video_prompt) }},\n  \"duration\": 5,\n  \"ratio\": \"720:1280\",\n  \"watermark\": false\n}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "notes": "API Runway corretta: api.dev.runwayml.com con header X-Runway-Version obbligatorio"
+    },
+    {
+      "id": "node-normalizza-risposta",
+      "name": "Normalizza Risposta Provider",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3110,
+        100
+      ],
+      "parameters": {
+        "jsCode": "const response = $input.item.json;\nconst prev = $('Estrai Video Prompt').item.json;\n\n// Kling ritorna: { code: 0, data: { task_id: '...', task_status: 'submitted' } }\n// Runway ritorna: { id: '...', status: 'RUNNING' }\nconst taskId = response?.data?.task_id   // Kling\n            || response?.id              // Runway\n            || null;\n\nif (!taskId) {\n  throw new Error(`Provider non ha restituito task_id. Response: ${JSON.stringify(response).substring(0, 200)}`);\n}\n\nreturn {\n  ...prev,\n  video_task_id: taskId,\n  provider_response: response\n};"
+      }
+    },
+    {
+      "id": "node-db-update-generating",
+      "name": "DB: Segna video_status = generating",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        3340,
+        100
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images?id=eq.{{ $json.image_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"video_status\": \"generating\",\n  \"video_task_id\": {{ JSON.stringify($json.video_task_id) }}\n}",
+        "options": {
+          "timeout": 10000
+        }
+      }
+    },
+    {
+      "id": "trigger-webhook",
+      "name": "Webhook — Callback I2V",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        500
+      ],
+      "parameters": {
+        "path": "i2v-callback",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "node-verifica-status-callback",
+      "name": "Verifica Status Callback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1730,
+        500
+      ],
+      "parameters": {
+        "jsCode": "const body = $input.item.json.body || $input.item.json;\n\n// Kling callback: { task_id, task_status: 'succeed'|'failed', task_result: { videos: [{url}] } }\n// Runway callback: { id, status: 'SUCCEEDED'|'FAILED', output: ['url'] }\nconst taskId = body.task_id || body.id;\nconst status = body.task_status || body.status || '';\n\nconst succeeded = ['succeed', 'SUCCEEDED', 'completed', 'success'].includes(status);\nconst failed    = ['failed', 'FAILED', 'error'].includes(status);\n\nconst videoUrl  = body.task_result?.videos?.[0]?.url  // Kling\n               || body.output?.[0]                    // Runway\n               || null;\n\nreturn {\n  task_id:    taskId,\n  succeeded:  succeeded,\n  failed:     failed,\n  video_url:  videoUrl,\n  raw_status: status,\n  raw_body:   JSON.stringify(body).substring(0, 500)\n};"
+      }
+    },
+    {
+      "id": "node-status-ok",
+      "name": "Video OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        500
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-succeeded",
+              "leftValue": "={{ $json.succeeded }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "node-db-completed",
+      "name": "DB: video_status = completed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2190,
+        420
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images?video_task_id=eq.{{ $json.task_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"video_status\": \"completed\",\n  \"video_url\": {{ JSON.stringify($json.video_url) }}\n}",
+        "options": {
+          "timeout": 10000
+        }
+      }
+    },
+    {
+      "id": "node-db-failed",
+      "name": "DB: video_status = failed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2190,
+        600
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images?video_task_id=eq.{{ $json.task_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"video_status\": \"failed\",\n  \"error_message\": {{ JSON.stringify('Video generation failed: ' + $json.raw_status) }}\n}",
+        "options": {
+          "timeout": 10000
+        }
+      }
+    },
+    {
+      "id": "node-telegram-success",
+      "name": "Telegram — Video Pronto",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [
+        2420,
+        420
+      ],
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "=🎥 <b>Video generato!</b>\n\nTask ID: <code>{{ $json.task_id }}</code>\nURL: {{ $json.video_url }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "notes": "FIX: rimosso il wrapping JSON stringa — ora invia testo corretto"
+    },
+    {
+      "id": "node-telegram-fail",
+      "name": "Telegram — Video Fallito",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [
+        2420,
+        600
+      ],
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "=⚠️ <b>Video generation fallita</b>\n\nTask ID: <code>{{ $json.task_id }}</code>\nStatus: {{ $json.raw_status }}\n\nControlla il DB: <code>SELECT * FROM images WHERE video_task_id='{{ $json.task_id }}';</code>",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      }
+    },
+    {
+      "id": "node-webhook-response",
+      "name": "Risposta Webhook (200 OK)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2650,
+        500
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"received\": true }"
+      }
+    },
+    {
+      "id": "node-check-calendar-flag",
+      "name": "Controlla Flag Calendario",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        330,
+        100
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/editorial_calendar",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "select",
+              "value": "id,generate_video,generate_audio,character_id"
+            },
+            {
+              "name": "id",
+              "value": "=eq.{{ $json.record.calendar_entry_id }}"
+            },
+            {
+              "name": "limit",
+              "value": "1"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "notes": "THROTTLING STEP 1: Legge i flag generate_video e generate_audio dal calendario. Se il post non ha calendar_entry_id (da bot Telegram), il nodo seguente usa il default."
+    },
+    {
+      "id": "node-valida-flags",
+      "name": "Video/Audio richiesti?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        100
+      ],
+      "parameters": {
+        "jsCode": "const calResponse = $input.item.json;\nconst trigger = $('Supabase Trigger (Image Approved)').item.json.record;\n\n// Legge i flag dal calendario (se esiste la voce)\nconst calEntry = Array.isArray(calResponse) ? calResponse[0] : null;\n\nconst generateVideo = calEntry?.generate_video === true;\nconst generateAudio = calEntry?.generate_audio === true;\n\n// Se non c'è calendario (post da bot Telegram),\n// usa il default del personaggio caricato dopo\n// Per ora: video OFF di default da bot, ON solo da calendario\nconst hasCalendar = !!trigger.calendar_entry_id;\n\nreturn {\n  ...trigger,\n  generate_video: hasCalendar ? generateVideo : false,\n  generate_audio: hasCalendar ? generateAudio : false,\n  has_calendar:   hasCalendar,\n  calendar_entry: calEntry\n};"
+      },
+      "notes": "THROTTLING STEP 2: Decide se generare video/audio. Default: false se non da calendario."
+    },
+    {
+      "id": "node-gate-video",
+      "name": "Genera Video?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        790,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-generate-video",
+              "leftValue": "={{ $json.generate_video }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "notes": "THROTTLING STEP 3: Gate principale. Solo se generate_video=true procede. Altrimenti imposta video_status=skipped e termina."
+    },
+    {
+      "id": "node-db-skip-video",
+      "name": "DB: video_status = skipped",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1010,
+        280
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images?id=eq.{{ $json.id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"video_status\": \"skipped\"\n}",
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "notes": "Video non richiesto per questa voce — segna skipped e termina senza fare nulla."
+    },
+    {
+      "id": "node-check-throttle",
+      "name": "Controlla Video in Corso",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1010,
+        100
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Prefer",
+              "value": "count=exact"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "select",
+              "value": "id"
+            },
+            {
+              "name": "character_id",
+              "value": "=eq.{{ $json.character_id }}"
+            },
+            {
+              "name": "video_status",
+              "value": "=eq.generating"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "notes": "THROTTLING STEP 4: Conta quanti video sono già in generazione per questo personaggio."
+    },
+    {
+      "id": "node-valida-throttle",
+      "name": "Slot libero? (max 1 video)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1230,
+        100
+      ],
+      "parameters": {
+        "jsCode": "const countResponse = $input.item.json;\nconst prev = $('Valida flags').item.json;\n\n// Supabase con Prefer: count=exact ritorna il conteggio nell'header Content-Range\n// Ma il nodo HTTP di n8n non espone gli header facilmente.\n// Alternativa: contiamo gli elementi nell'array risposta\nconst inProgress = Array.isArray(countResponse)\n  ? countResponse.length\n  : (countResponse?.count || 0);\n\n// MAX 1 video per personaggio in generazione contemporaneamente\n// (evita burst di spese su Runway/Kling)\nconst MAX_CONCURRENT = 1;\nconst canProceed = inProgress < MAX_CONCURRENT;\n\nreturn {\n  ...prev,\n  videos_in_progress: inProgress,\n  can_proceed_video: canProceed,\n  throttle_reason: canProceed\n    ? null\n    : `${inProgress} video già in generazione per questo personaggio (max ${MAX_CONCURRENT})`\n};"
+      }
+    },
+    {
+      "id": "node-gate-throttle",
+      "name": "Slot disponibile?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1450,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-throttle",
+              "leftValue": "={{ $json.can_proceed_video }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "node-db-throttled",
+      "name": "DB: video_status = pending (riaccodato)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1670,
+        280
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images?id=eq.{{ $json.id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"video_status\": \"pending\"\n}",
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "notes": "Troppi video in corso: rimane pending. Verrà ripreso dal cron di recovery ogni 30 minuti."
+    }
+  ],
+  "connections": {
+    "Supabase Trigger (Image Approved)": {
+      "main": [
+        [
+          {
+            "node": "Controlla Flag Calendario",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Carica Dati Personaggio": {
+      "main": [
+        [
+          {
+            "node": "Prepara Dati Generazione",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepara Dati Generazione": {
+      "main": [
+        [
+          {
+            "node": "Claude — Genera Video Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude — Genera Video Prompt": {
+      "main": [
+        [
+          {
+            "node": "Estrai Video Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Estrai Video Prompt": {
+      "main": [
+        [
+          {
+            "node": "Scegli Provider Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scegli Provider Video": {
+      "main": [
+        [
+          {
+            "node": "Kling v1.5 — Generate Async",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Runway Gen-3 — Generate Async",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kling v1.5 — Generate Async": {
+      "main": [
+        [
+          {
+            "node": "Normalizza Risposta Provider",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Runway Gen-3 — Generate Async": {
+      "main": [
+        [
+          {
+            "node": "Normalizza Risposta Provider",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizza Risposta Provider": {
+      "main": [
+        [
+          {
+            "node": "DB: Segna video_status = generating",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook — Callback I2V": {
+      "main": [
+        [
+          {
+            "node": "Verifica Status Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verifica Status Callback": {
+      "main": [
+        [
+          {
+            "node": "Video OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Video OK?": {
+      "main": [
+        [
+          {
+            "node": "DB: video_status = completed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "DB: video_status = failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB: video_status = completed": {
+      "main": [
+        [
+          {
+            "node": "Telegram — Video Pronto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB: video_status = failed": {
+      "main": [
+        [
+          {
+            "node": "Telegram — Video Fallito",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram — Video Pronto": {
+      "main": [
+        [
+          {
+            "node": "Risposta Webhook (200 OK)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram — Video Fallito": {
+      "main": [
+        [
+          {
+            "node": "Risposta Webhook (200 OK)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Controlla Flag Calendario": {
+      "main": [
+        [
+          {
+            "node": "Video/Audio richiesti?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Video/Audio richiesti?": {
+      "main": [
+        [
+          {
+            "node": "Genera Video?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Genera Video?": {
+      "main": [
+        [
+          {
+            "node": "Controlla Video in Corso",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "DB: video_status = skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Controlla Video in Corso": {
+      "main": [
+        [
+          {
+            "node": "Slot libero? (max 1 video)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot libero? (max 1 video)": {
+      "main": [
+        [
+          {
+            "node": "Slot disponibile?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot disponibile?": {
+      "main": [
+        [
+          {
+            "node": "Carica Dati Personaggio",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "DB: video_status = pending (riaccodato)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    {
+      "name": "video"
+    },
+    {
+      "name": "i2v"
+    }
+  ],
+  "notes": "v3 — AGGIUNTO THROTTLING: (1) Rispetta flag generate_video/generate_audio dal calendario (2) Gate che blocca se generate_video=false (3) Max 1 video per personaggio in contemporanea (4) Se throttled: rimane pending per recovery cron"
+}

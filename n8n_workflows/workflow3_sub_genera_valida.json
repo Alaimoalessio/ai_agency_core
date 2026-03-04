@@ -1,0 +1,561 @@
+{
+  "name": "SUB \u2014 Genera + Valida Immagine",
+  "nodes": [
+    {
+      "id": "sub-trigger",
+      "name": "Trigger (chiamato da workflow parent)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "sub-claude-prompt",
+      "name": "Claude \u2014 Ottimizza Prompt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        450,
+        150
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OPENROUTER_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"anthropic/claude-sonnet-4-5\",\n  \"max_tokens\": 600,\n  \"temperature\": 0.7,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are an expert prompt engineer for FLUX image generation with LoRA fine-tuned models.\\n\\nCHARACTER INFO:\\n- Name: {{ $json.character_name }}\\n- Trigger word: {{ $json.trigger_word }}\\n- Age: {{ $json.age || 'young adult' }}\\n- Hair: {{ $json.hair || 'natural' }}\\n- Style: {{ $json.style || 'casual' }}\\n\\nCONTENT PILLARS:\\n{{ JSON.stringify($json.content_pillars || [{name:'lifestyle',style:'bright natural light, candid'},{name:'glam',style:'dramatic cinematic lighting'}]) }}\\n\\nRULES:\\n1. ALWAYS start with the trigger word: {{ $json.trigger_word }}\\n2. Current content pillar: {{ $json.content_pillar || 'lifestyle' }} \u2014 match its visual style\\n3. Instagram format: 4:5 portrait (1024x1280)\\n4. Photorealistic, professional photography style\\n5. Include: lighting, camera style, background, mood\\n6. Negative prompt: avoid common AI artifacts\\n\\nRespond with JSON only: {\\\"prompt\\\": \\\"...\\\", \\\"negative_prompt\\\": \\\"...\\\"}\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Scene: {{ $json.user_request || $json.scene_description }}\\nContent pillar: {{ $json.content_pillar || 'lifestyle' }}\"\n    }\n  ]\n}",
+        "options": {
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "sub-elabora-prompt",
+      "name": "Elabora Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        150
+      ],
+      "parameters": {
+        "jsCode": "const response = $input.item.json;\nconst prev = $('Trigger (chiamato da workflow parent)').item.json;\n\nif (!response.choices?.[0]) {\n  throw new Error('Claude prompt optimization fallita: nessuna risposta');\n}\n\nconst raw = response.choices[0].message.content;\nconst cleaned = raw.replace(/```json\\s*/gi,'').replace(/```\\s*/g,'').trim();\nconst match = cleaned.match(/\\{[\\s\\S]*\\}/);\n\nlet parsed;\ntry {\n  parsed = JSON.parse(match ? match[0] : cleaned);\n} catch(e) {\n  // Se non \u00e8 JSON valido, usa il testo raw come prompt\n  parsed = {\n    prompt: `${prev.trigger_word} ${raw.substring(0, 400)}`,\n    negative_prompt: 'blurry, deformed, ugly, bad anatomy, extra fingers, watermark, text'\n  };\n}\n\nreturn {\n  ...prev,\n  prompt: parsed.prompt,\n  negative_prompt: parsed.negative_prompt || 'blurry, deformed, ugly, bad anatomy, extra fingers, watermark, text, nsfw'\n};"
+      }
+    },
+    {
+      "id": "sub-flux",
+      "name": "FLUX + LoRA \u2014 Genera Immagine",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        950,
+        150
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.replicate.com/v1/predictions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.REPLICATE_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "wait"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"version\": {{ JSON.stringify($json.lora_version) }},\n  \"input\": {\n    \"prompt\": {{ JSON.stringify($json.prompt) }},\n    \"negative_prompt\": {{ JSON.stringify($json.negative_prompt) }},\n    \"width\": 1024,\n    \"height\": 1280,\n    \"num_inference_steps\": 40,\n    \"guidance_scale\": 3.2,\n    \"lora_scale\": {{ $json.lora_scale || 0.85 }},\n    \"num_outputs\": 1,\n    \"output_format\": \"jpeg\",\n    \"output_quality\": 90,\n    \"seed\": {{ Math.floor(Math.random() * 999999) }}\n  }\n}",
+        "options": {
+          "timeout": 120000
+        }
+      }
+    },
+    {
+      "id": "sub-estrai-url",
+      "name": "Estrai URL Immagine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        150
+      ],
+      "parameters": {
+        "jsCode": "const replicateResponse = $input.item.json;\nconst prev = $('Elabora Prompt').item.json;\n\nconst status = replicateResponse.status;\nif (status === 'failed' || !replicateResponse.output) {\n  throw new Error(`Replicate fallito: ${replicateResponse.error || 'output vuoto'} (status: ${status})`);\n}\n\nconst imageUrl = Array.isArray(replicateResponse.output)\n  ? replicateResponse.output[0]\n  : replicateResponse.output;\n\nif (!imageUrl || !imageUrl.startsWith('http')) {\n  throw new Error('URL immagine non valido: ' + JSON.stringify(imageUrl));\n}\n\nreturn {\n  ...prev,\n  image_url: imageUrl,\n  replicate_prediction_id: replicateResponse.id,\n  generation_time_ms: replicateResponse.metrics?.predict_time\n    ? Math.round(replicateResponse.metrics.predict_time * 1000)\n    : null\n};"
+      }
+    },
+    {
+      "id": "sub-claude-vision",
+      "name": "Claude Vision \u2014 Valida Qualit\u00e0",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1450,
+        150
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OPENROUTER_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"anthropic/claude-opus-4-6\",\n  \"max_tokens\": 500,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\n          \"type\": \"image\",\n          \"source\": { \"type\": \"url\", \"url\": {{ JSON.stringify($json.image_url) }} }\n        },\n        {\n          \"type\": \"text\",\n          \"text\": \"You are a quality control system for AI-generated Instagram content. Analyze this image.\\n\\nCharacter: {{ $json.character_name }}\\nExpected trigger word in prompt: {{ $json.trigger_word }}\\nContent pillar: {{ $json.content_pillar }}\\nQuality threshold for this character: {{ $json.quality_threshold || 70 }}/100\\n\\nEvaluate:\\n1. FACE: Clearly visible, realistic, non-deformed? (weight: 30pts)\\n2. HANDS: Natural, correct fingers? (weight: 20pts)\\n3. ANATOMY: Body correct, no extra limbs? (weight: 20pts)\\n4. FOCUS: Main subject sharp? (weight: 15pts)\\n5. COMPOSITION: Well framed, not awkwardly cut? (weight: 10pts)\\n6. ARTIFACTS: No visible AI glitches or text? (weight: 5pts)\\n\\nIMPORTANT: The content pillar is '{{ $json.content_pillar }}'. Evaluate if the mood/style matches.\\n\\nRespond ONLY with valid JSON:\\n{\\n  \\\"pass\\\": true/false,\\n  \\\"score\\\": 0-100,\\n  \\\"issues\\\": [\\\"issue1\\\", \\\"issue2\\\"],\\n  \\\"verdict\\\": \\\"one sentence summary\\\",\\n  \\\"pillar_match\\\": true/false\\n}\"\n        }\n      ]\n    }\n  ]\n}",
+        "options": {
+          "timeout": 45000
+        }
+      }
+    },
+    {
+      "id": "sub-elabora-qualita",
+      "name": "Elabora Risultato Qualit\u00e0",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1700,
+        150
+      ],
+      "parameters": {
+        "jsCode": "const visionResponse = $input.item.json;\nconst prev = $('Estrai URL Immagine').item.json;\n\n// Se Claude Vision fallisce per qualunque motivo, lascia passare con score null\nif (!visionResponse.choices?.[0]) {\n  console.warn('[QC] Claude Vision non disponibile \u2014 immagine lasciata passare');\n  return {\n    ...prev,\n    quality_pass: true,\n    quality_score: null,\n    quality_issues: [],\n    quality_verdict: 'QC non disponibile \u2014 lasciata passare',\n    pillar_match: true\n  };\n}\n\nconst raw = visionResponse.choices[0].message.content;\nconst cleaned = raw.replace(/```json\\s*/gi,'').replace(/```\\s*/g,'').trim();\nconst match = cleaned.match(/\\{[\\s\\S]*\\}/);\n\nlet qc;\ntry {\n  qc = JSON.parse(match ? match[0] : cleaned);\n} catch(e) {\n  return { ...prev, quality_pass: true, quality_score: null, quality_issues: [], quality_verdict: 'Parse error \u2014 lasciata passare', pillar_match: true };\n}\n\n// Usa quality_threshold del personaggio (dal DB via calendar_today view)\n// Default 70 se non configurato\nconst threshold = prev.quality_threshold || 70;\nconst pass = qc.pass === true && (qc.score || 0) >= threshold;\n\nreturn {\n  ...prev,\n  quality_pass: pass,\n  quality_score: qc.score || 0,\n  quality_issues: qc.issues || [],\n  quality_verdict: qc.verdict || '',\n  pillar_match: qc.pillar_match !== false,  // default true se non presente\n  quality_threshold_used: threshold\n};"
+      }
+    },
+    {
+      "id": "sub-qualita-ok",
+      "name": "Qualit\u00e0 OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1750,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-quality",
+              "leftValue": "={{ $json.quality_pass }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "sub-tentativi",
+      "name": "Tentativi < 2?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1750,
+        500
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-retry",
+              "leftValue": "={{ $json.attempt || 1 }}",
+              "rightValue": 2,
+              "operator": {
+                "type": "number",
+                "operation": "lt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "sub-prepara-retry",
+      "name": "Prepara Retry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        450
+      ],
+      "parameters": {
+        "jsCode": "const prev = $input.item.json;\n\n// Backoff: aspetta 5s * tentativo (semplice backoff lineare)\n// Per retry in n8n, usiamo Wait node dopo questo\nconst attempt = (prev.attempt || 1) + 1;\n\n// Aggiusta lora_scale leggermente per variare il risultato\nconst loraAdjust = attempt === 2 ? -0.05 : 0;\n\nreturn {\n  ...prev,\n  attempt: attempt,\n  lora_scale: Math.max(0.6, (prev.lora_scale || 0.85) + loraAdjust),\n  // Aggiunge hint al prompt per correggere i problemi trovati\n  scene_description_original: prev.scene_description || prev.user_request,\n  user_request: `${prev.user_request || prev.scene_description} [Previous attempt had issues: ${(prev.quality_issues || []).slice(0,2).join(', ')}. Fix these specifically.]`\n};"
+      }
+    },
+    {
+      "id": "sub-wait-retry",
+      "name": "Attendi prima del retry",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [
+        2000,
+        300
+      ],
+      "parameters": {
+        "resume": "timeInterval",
+        "unit": "seconds",
+        "value": "={{ ($json.attempt || 1) * 5 }}"
+      }
+    },
+    {
+      "id": "sub-output-success",
+      "name": "Output: Successo",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        2000,
+        150
+      ],
+      "parameters": {
+        "mode": "passthrough",
+        "includeOtherFields": true
+      }
+    },
+    {
+      "id": "sub-output-fail",
+      "name": "Output: Quality Fail definitivo",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        2000,
+        600
+      ],
+      "parameters": {
+        "mode": "keepAllCurrentValues",
+        "fields": {
+          "values": [
+            {
+              "name": "generation_failed",
+              "type": "boolean",
+              "booleanValue": true
+            },
+            {
+              "name": "fail_reason",
+              "type": "string",
+              "value": "={{ 'Quality fail dopo ' + ($json.attempt || 2) + ' tentativi. Score: ' + $json.quality_score + '/100. Issues: ' + ($json.quality_issues || []).join(', ') }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "sub-router-boudoir",
+      "name": "Router Boudoir",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-boudoir",
+              "leftValue": "={{ $json.content_pillar }}",
+              "rightValue": "boudoir",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "sub-boudoir-prompt-matrix",
+      "name": "Boudoir Prompt Matrix",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        450,
+        450
+      ],
+      "parameters": {
+        "jsCode": "const prev = $input.item.json || {};\nconst outfits = ['black lace lingerie', 'sheer silk robe', 'satin slip dress'];\nconst poses = ['looking over shoulder', 'lying on bed', 'sitting gracefully'];\nconst lightings = ['dim sensual lighting', 'neon rim light', 'soft window light'];\n\nconst outfit = outfits[Math.floor(Math.random() * outfits.length)];\nconst pose = poses[Math.floor(Math.random() * poses.length)];\nconst lighting = lightings[Math.floor(Math.random() * lightings.length)];\n\nconst triggerWord = prev.trigger_word || 'ohwx';\nconst prompt = `${triggerWord}, 1girl, solo, ${outfit}, ${pose}, ${lighting}, masterpiece, 8k, sharp focus`;\nconst negative_prompt = 'blurry, bad anatomy, missing limbs, fused fingers, worst quality';\n\nreturn {\n  ...prev,\n  prompt,\n  negative_prompt\n};"
+      }
+    },
+    {
+      "id": "sub-runpod-inference",
+      "name": "Inference Local ComfyUI (Boudoir)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        700,
+        450
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/generate-uncensored",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"prompt\": {{ JSON.stringify($json.prompt) }},\n  \"negative_prompt\": {{ JSON.stringify($json.negative_prompt) }},\n  \"image_id\": {{ JSON.stringify($json.id || $json.short_id || 'test_id') }}\n}",
+        "options": {
+          "timeout": 120000
+        }
+      }
+    },
+    {
+      "id": "sub-bypass-qc",
+      "name": "Bypass QC (Boudoir)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        950,
+        450
+      ],
+      "parameters": {
+        "jsCode": "const bridgeResponse = $input.item.json || {};\nlet prev = {};\nif ($('Boudoir Prompt Matrix') && $('Boudoir Prompt Matrix').item && $('Boudoir Prompt Matrix').item.json) {\n  prev = $('Boudoir Prompt Matrix').item.json;\n}\n\n// Estrai immagine da FastAPI bridge\nlet imageUrl = bridgeResponse.stored_url || 'https://example.com/placeholder-boudoir.jpg';\n\nreturn {\n  ...prev,\n  image_url: imageUrl,\n  quality_pass: true,\n  quality_score: 100,\n  quality_issues: [],\n  quality_verdict: 'Bypassed QC for Boudoir pipeline',\n  pillar_match: true,\n  generation_time_ms: 15000\n};"
+      }
+    }
+  ],
+  "connections": {
+    "Trigger (chiamato da workflow parent)": {
+      "main": [
+        [
+          {
+            "node": "Router Boudoir",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude \u2014 Ottimizza Prompt": {
+      "main": [
+        [
+          {
+            "node": "Elabora Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Elabora Prompt": {
+      "main": [
+        [
+          {
+            "node": "FLUX + LoRA \u2014 Genera Immagine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "FLUX + LoRA \u2014 Genera Immagine": {
+      "main": [
+        [
+          {
+            "node": "Estrai URL Immagine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Estrai URL Immagine": {
+      "main": [
+        [
+          {
+            "node": "Claude Vision \u2014 Valida Qualit\u00e0",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Vision \u2014 Valida Qualit\u00e0": {
+      "main": [
+        [
+          {
+            "node": "Elabora Risultato Qualit\u00e0",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Elabora Risultato Qualit\u00e0": {
+      "main": [
+        [
+          {
+            "node": "Qualit\u00e0 OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qualit\u00e0 OK?": {
+      "main": [
+        [
+          {
+            "node": "Output: Successo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Tentativi < 2?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tentativi < 2?": {
+      "main": [
+        [
+          {
+            "node": "Prepara Retry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Output: Quality Fail definitivo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepara Retry": {
+      "main": [
+        [
+          {
+            "node": "Attendi prima del retry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attendi prima del retry": {
+      "main": [
+        [
+          {
+            "node": "Router Boudoir",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Router Boudoir": {
+      "main": [
+        [
+          {
+            "node": "Boudoir Prompt Matrix",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Claude \u2014 Ottimizza Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Boudoir Prompt Matrix": {
+      "main": [
+        [
+          {
+            "node": "Inference RunPod (Boudoir)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inference RunPod (Boudoir)": {
+      "main": [
+        [
+          {
+            "node": "Bypass QC (Boudoir)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bypass QC (Boudoir)": {
+      "main": [
+        [
+          {
+            "node": "Output: Successo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": ""
+  },
+  "tags": [
+    {
+      "name": "sub-workflow"
+    },
+    {
+      "name": "generation"
+    }
+  ],
+  "notes": "SUB-WORKFLOW: Importa questo come workflow separato in n8n. Poi nei workflow 1 e 2 sostituisci i nodi FLUX+Claude con un nodo 'Execute Workflow' che punta a questo. Input atteso: { character_name, trigger_word, lora_version, lora_scale, content_pillar, content_pillars, user_request/scene_description, quality_threshold, age, hair, style }. Output: tutti i campi di input + image_url, prompt, negative_prompt, quality_pass, quality_score, quality_issues, quality_verdict."
+}

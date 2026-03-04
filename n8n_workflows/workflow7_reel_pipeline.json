@@ -1,0 +1,754 @@
+{
+  "name": "Workflow 7 — Reel Pipeline V2V (Motion Library)",
+  "nodes": [
+    {
+      "id": "wf7-trigger",
+      "name": "Trigger Reel (Ogni 15 min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [0, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "*/15 * * * *" }
+          ]
+        }
+      },
+      "notes": "Poll ogni 15 min sulla reel_generation_queue. Alternativa: usare Supabase Trigger su reel_status=pending come WF5."
+    },
+    {
+      "id": "wf7-carica-coda",
+      "name": "Carica Reel in Coda",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [250, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/reel_generation_queue",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}" }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "limit", "value": "5" }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      }
+    },
+    {
+      "id": "wf7-ci-sono",
+      "name": "Ci sono Reel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-reel",
+              "leftValue": "={{ $json.length }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "wf7-splitta",
+      "name": "Splitta Reel",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [750, 250],
+      "parameters": {
+        "batchSize": 1,
+        "options": { "reset": false }
+      }
+    },
+    {
+      "id": "wf7-claim-slot",
+      "name": "Claim Slot (Atomico)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1000, 250],
+      "notes": "Chiama check_and_claim_reel_slot() via RPC — atomico, evita race condition tra esecuzioni parallele.",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/rpc/check_and_claim_reel_slot",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={ \"p_image_id\": {{ JSON.stringify($json.image_id) }}, \"p_character_id\": {{ JSON.stringify($json.character_id) }}, \"p_max_concurrent\": 1 }",
+        "options": { "timeout": 10000 }
+      }
+    },
+    {
+      "id": "wf7-slot-ok",
+      "name": "Slot Disponibile?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1250, 250],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-slot",
+              "leftValue": "={{ $json }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equal" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "wf7-skip-throttled",
+      "name": "Skip — Throttled",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1250, 450],
+      "parameters": {},
+      "notes": "Slot pieno — questo Reel rimarrà pending e verrà ripreso al prossimo ciclo."
+    },
+    {
+      "id": "wf7-pick-clip",
+      "name": "Scegli Clip dalla Libreria",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1500, 250],
+      "notes": "Chiama pick_motion_clip() — seleziona il clip meno usato per questo personaggio e motion_type.",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/rpc/pick_motion_clip",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p_character_id: $('Splitta Reel').item.json.character_id, p_motion_type: $('Splitta Reel').item.json.reel_motion_type || null }) }}",
+        "options": { "timeout": 10000 }
+      }
+    },
+    {
+      "id": "wf7-clip-trovato",
+      "name": "Clip Trovato?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1750, 250],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-clip",
+              "leftValue": "={{ Array.isArray($json) ? $json.length : ($json?.motion_id ? 1 : 0) }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "wf7-no-clip",
+      "name": "Errore — Nessun Clip in Libreria",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1750, 450],
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "=⚠️ *Reel Pipeline*: Nessun clip in motion_library per il personaggio {{ $('Splitta Reel').item.json.character_name }}.\n\nCarica almeno un clip su Supabase Storage → bucket `motion-library` e inserisci il record nella tabella `motion_library`.",
+        "additionalFields": { "parse_mode": "Markdown" }
+      }
+    },
+    {
+      "id": "wf7-prepara-dati",
+      "name": "Prepara Dati per Claude",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 250],
+      "parameters": {
+        "jsCode": "const reel = $('Splitta Reel').item.json;\nconst clipData = $input.item.json;\n// RPC ritorna array o oggetto diretto\nconst clip = Array.isArray(clipData) ? clipData[0] : clipData;\n\nif (!clip || !clip.motion_id) {\n  throw new Error(`Clip non trovato per character=${reel.character_name}`);\n}\n\nreturn {\n  // Dati immagine\n  image_id: reel.image_id,\n  image_url: reel.watermarked_url || reel.stored_url,\n  character_id: reel.character_id,\n  character_name: reel.character_name,\n  content_pillar: reel.content_pillar,\n  scene_description: reel.scene_description,\n  // Dati clip\n  motion_id: clip.motion_id,\n  motion_url: clip.public_url,\n  motion_type: clip.motion_type,\n  motion_description: clip.description,\n  motion_mood: clip.mood,\n  motion_duration: clip.duration_seconds,\n  // Settings reel\n  reel_audio_type: reel.reel_audio_type || 'trending',\n  publish_tiktok: reel.reel_publish_tiktok !== false,\n  publish_reels: reel.reel_publish_reels !== false,\n  publish_shorts: reel.reel_publish_shorts === true,\n  // Provider\n  provider: $env.REEL_PROVIDER || 'kling'  // override da env se necessario\n};"
+      }
+    },
+    {
+      "id": "wf7-claude-prompt",
+      "name": "Claude — Genera Reel Prompt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2250, 250],
+      "notes": "Claude genera il prompt V2V ottimizzato per il provider scelto, tenendo conto del personaggio e del tipo di movimento.",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $env.ANTHROPIC_API_KEY }}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-opus-4-5\",\n  \"max_tokens\": 500,\n  \"system\": \"Sei un esperto di content creation per TikTok e Instagram Reels. Generi prompt ottimizzati per Video-to-Video AI (Kling/Runway). I prompt devono preservare il movimento del video originale e applicare lo stile del personaggio AI. Rispondi SOLO con un JSON: {\\\"v2v_prompt\\\": \\\"...\\\", \\\"caption\\\": \\\"...\\\", \\\"hashtags\\\": \\\"...\\\"}\",\n  \"messages\": [{\n    \"role\": \"user\",\n    \"content\": \"Personaggio: {{ $json.character_name }}\\nPillar: {{ $json.content_pillar }}\\nScena: {{ $json.scene_description }}\\nTipo movimento: {{ $json.motion_type }}\\nDescrizione clip: {{ $json.motion_description }}\\nMood clip: {{ $json.motion_mood }}\\nProvider: {{ $json.provider }}\\n\\nGenera:\\n1. v2v_prompt: prompt per il Video-to-Video (max 200 caratteri, inglese, descrivi come l'avatar deve apparire nel video mantenendo il movimento originale)\\n2. caption: caption Instagram/TikTok in italiano (max 150 caratteri, emoji incluse, coinvolgente)\\n3. hashtags: 10-15 hashtag italiani + internazionali rilevanti separati da spazio\"\n  }]\n}",
+        "options": { "timeout": 30000 }
+      }
+    },
+    {
+      "id": "wf7-estrai-prompt",
+      "name": "Estrai Prompt V2V",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2500, 250],
+      "parameters": {
+        "jsCode": "const claudeResp = $input.item.json;\nconst prev = $('Prepara Dati per Claude').item.json;\n\nconst raw = claudeResp.content?.[0]?.text || '{}';\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch {\n  // Fallback: estrai JSON dal testo se c'è del testo extra\n  const match = raw.match(/\\{[\\s\\S]*\\}/);\n  parsed = match ? JSON.parse(match[0]) : {};\n}\n\nif (!parsed.v2v_prompt) {\n  throw new Error('Claude non ha restituito v2v_prompt. Risposta: ' + raw);\n}\n\nreturn {\n  ...prev,\n  v2v_prompt: parsed.v2v_prompt,\n  reel_caption: parsed.caption || '',\n  reel_hashtags: parsed.hashtags || ''\n};"
+      }
+    },
+    {
+      "id": "wf7-sceglie-provider",
+      "name": "Sceglie Provider",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [2750, 250],
+      "parameters": {
+        "mode": "expression",
+        "output": "={{ $json.provider }}",
+        "rules": {
+          "rules": [
+            { "outputKey": "kling", "value": "kling" },
+            { "outputKey": "runway", "value": "runway" }
+          ]
+        },
+        "fallbackOutput": "kling"
+      }
+    },
+    {
+      "id": "wf7-kling-v2v",
+      "name": "Kling v1.6 — V2V Async",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [3000, 150],
+      "notes": "Kling V2V: usa image + video reference. Async — il risultato arriva via webhook.",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.klingai.com/v1/videos/video2video",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.KLING_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"kling-v1-6\",\n  \"image_url\": {{ JSON.stringify($json.image_url) }},\n  \"video_url\": {{ JSON.stringify($json.motion_url) }},\n  \"prompt\": {{ JSON.stringify($json.v2v_prompt) }},\n  \"duration\": 5,\n  \"mode\": \"pro\",\n  \"callback_url\": {{ JSON.stringify($env.N8N_WEBHOOK_BASE_URL + '/webhook/reel-callback') }}\n}",
+        "options": { "timeout": 30000 }
+      }
+    },
+    {
+      "id": "wf7-runway-v2v",
+      "name": "Runway Gen-3 — V2V Async",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [3000, 350],
+      "notes": "Runway Gen-3 V2V. Async — polling o webhook per il risultato.",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.dev.runwayml.com/v1/image_to_video",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.RUNWAY_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "X-Runway-Version", "value": "2024-11-06" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gen3a_turbo\",\n  \"promptImage\": {{ JSON.stringify($json.image_url) }},\n  \"promptText\": {{ JSON.stringify($json.v2v_prompt) }},\n  \"duration\": 5,\n  \"ratio\": \"720:1280\",\n  \"watermark\": false\n}",
+        "options": { "timeout": 30000 }
+      }
+    },
+    {
+      "id": "wf7-normalizza-risposta",
+      "name": "Normalizza Risposta Provider",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3250, 250],
+      "parameters": {
+        "jsCode": "const resp = $input.item.json;\nconst prev = $('Estrai Prompt V2V').item.json;\n\n// Normalizza task_id e status da provider diversi\nlet task_id, status;\n\n// Kling response: { data: { task_id: '...', task_status: 'submitted' } }\nif (resp.data?.task_id) {\n  task_id = resp.data.task_id;\n  status = resp.data.task_status || 'submitted';\n}\n// Runway response: { id: '...', status: 'RUNNING' }\nelse if (resp.id) {\n  task_id = resp.id;\n  status = resp.status || 'RUNNING';\n}\nelse {\n  throw new Error('Provider non ha restituito task_id. Risposta: ' + JSON.stringify(resp));\n}\n\nreturn {\n  ...prev,\n  reel_task_id: task_id,\n  provider_status: status\n};"
+      }
+    },
+    {
+      "id": "wf7-db-segna-generating",
+      "name": "DB: reel_status = generating",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [3500, 250],
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images?id=eq.{{ $json.image_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"reel_status\": \"generating\",\n  \"reel_task_id\": {{ JSON.stringify($json.reel_task_id) }},\n  \"reel_provider\": {{ JSON.stringify($json.provider) }},\n  \"reel_prompt\": {{ JSON.stringify($json.v2v_prompt) }},\n  \"source_motion_id\": {{ JSON.stringify($json.motion_id) }}\n}",
+        "options": { "timeout": 10000 }
+      }
+    },
+    {
+      "id": "wf7-log-costo",
+      "name": "DB: Log Costo V2V",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [3750, 250],
+      "notes": "Logga il costo V2V in cost_events tramite la funzione log_cost_event()",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/rpc/log_cost_event",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"p_image_id\": {{ JSON.stringify($json.image_id) }},\n  \"p_character_id\": {{ JSON.stringify($json.character_id) }},\n  \"p_service\": {{ JSON.stringify($json.provider) }},\n  \"p_operation\": \"v2v_4s\",\n  \"p_units\": 1,\n  \"p_workflow\": \"reel_pipeline\"\n}",
+        "options": { "timeout": 10000 }
+      }
+    },
+
+    {
+      "id": "wf7-webhook-callback",
+      "name": "Webhook — Callback V2V",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 700],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "reel-callback",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "notes": "Riceve il callback asincrono da Kling/Runway quando il video è pronto. Configurare path in: N8N_WEBHOOK_BASE_URL/webhook/reel-callback"
+    },
+    {
+      "id": "wf7-verifica-callback",
+      "name": "Verifica Callback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [250, 700],
+      "parameters": {
+        "jsCode": "const body = $input.item.json.body || $input.item.json;\n\n// Normalizza callback da Kling e Runway\nlet task_id, video_url, success, error_msg;\n\n// Kling callback: { data: { task_id, task_status, task_result: { videos: [{url}] } } }\nif (body.data?.task_id) {\n  task_id   = body.data.task_id;\n  success   = body.data.task_status === 'succeed';\n  video_url = body.data?.task_result?.videos?.[0]?.url || null;\n  error_msg = success ? null : (body.data.task_status_msg || 'Kling generation failed');\n}\n// Runway callback: { id, status, output: [url] }\nelse if (body.id) {\n  task_id   = body.id;\n  success   = body.status === 'SUCCEEDED';\n  video_url = body.output?.[0] || null;\n  error_msg = success ? null : (body.failure || 'Runway generation failed');\n}\nelse {\n  throw new Error('Callback non riconosciuto: ' + JSON.stringify(body).slice(0, 200));\n}\n\nreturn { task_id, video_url, success, error_msg };"
+      }
+    },
+    {
+      "id": "wf7-trova-record",
+      "name": "Trova Record per Task ID",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 700],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "reel_task_id", "value": "=eq.{{ $json.task_id }}" },
+            { "name": "select", "value": "id,character_id,reel_caption,reel_hashtags,reel_provider,reel_publish_tiktok,reel_publish_reels,reel_publish_shorts,characters(instagram_account_id,instagram_access_token_enc,name)" },
+            { "name": "limit", "value": "1" }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      }
+    },
+    {
+      "id": "wf7-reel-ok",
+      "name": "Video OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [750, 700],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-ok",
+              "leftValue": "={{ $('Verifica Callback').item.json.success }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equal" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "wf7-scarica-video",
+      "name": "Scarica Video da Provider",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1000, 600],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Verifica Callback').item.json.video_url }}",
+        "options": {
+          "timeout": 60000,
+          "response": { "response": { "fullResponse": false, "responseFormat": "file" } }
+        }
+      }
+    },
+    {
+      "id": "wf7-upload-storage",
+      "name": "Upload Reel su Supabase Storage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1250, 600],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/storage/v1/object/reels-output/{{ $('Trova Record per Task ID').item.json[0].id }}_{{ Date.now() }}.mp4",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "video/mp4" },
+            { "name": "x-upsert", "value": "true" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "binaryData",
+        "binaryPropertyName": "data",
+        "options": { "timeout": 60000 }
+      }
+    },
+    {
+      "id": "wf7-prepara-publish",
+      "name": "Prepara URL Pubblico",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1500, 600],
+      "parameters": {
+        "jsCode": "const record = $('Trova Record per Task ID').item.json[0];\nconst uploadResp = $input.item.json;\nconst callback = $('Verifica Callback').item.json;\n\n// Costruisci URL pubblico del bucket reels-output\nconst storagePath = uploadResp.Key || uploadResp.path || '';\nconst publicUrl = `${$env.SUPABASE_URL}/storage/v1/object/public/reels-output/${storagePath.replace('reels-output/', '')}`;\n\nreturn {\n  image_id:      record.id,\n  character_id:  record.character_id,\n  reel_url:      publicUrl,\n  provider:      record.reel_provider,\n  publish_ig:    record.reel_publish_reels !== false,\n  publish_tiktok: record.reel_publish_tiktok !== false,\n  publish_shorts: record.reel_publish_shorts === true,\n  ig_account:    record.characters?.instagram_account_id,\n  character_name: record.characters?.name,\n  caption_base:  record.reel_caption || '',\n  hashtags:      record.reel_hashtags || ''\n};"
+      }
+    },
+    {
+      "id": "wf7-db-completed",
+      "name": "DB: reel_status = completed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1750, 600],
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images?id=eq.{{ $json.image_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={ \"reel_status\": \"completed\", \"reel_url\": {{ JSON.stringify($json.reel_url) }} }",
+        "options": { "timeout": 10000 }
+      }
+    },
+    {
+      "id": "wf7-publish-ig-reel",
+      "name": "Instagram — Pubblica Reel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2000, 600],
+      "notes": "Usa Instagram Graph API per pubblicare il Reel. Richiede token con permesso instagram_basic + instagram_content_publish.",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.ig_account }}/media",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "media_type", "value": "REELS" },
+            { "name": "video_url", "value": "={{ $json.reel_url }}" },
+            { "name": "caption", "value": "={{ $json.caption_base + '\\n\\n' + $json.hashtags }}" },
+            { "name": "share_to_feed", "value": "true" },
+            { "name": "access_token", "value": "={{ $env.IG_ACCESS_TOKEN }}" }
+          ]
+        },
+        "options": { "timeout": 30000 }
+      }
+    },
+    {
+      "id": "wf7-attendi-ig",
+      "name": "Attendi 10s (IG Processing)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [2250, 600],
+      "parameters": { "amount": 10, "unit": "seconds" }
+    },
+    {
+      "id": "wf7-pubblica-ig",
+      "name": "Instagram — Publish Reel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2500, 600],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.ig_account }}/media_publish",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "creation_id", "value": "={{ $('Instagram — Pubblica Reel').item.json.id }}" },
+            { "name": "access_token", "value": "={{ $env.IG_ACCESS_TOKEN }}" }
+          ]
+        },
+        "options": { "timeout": 30000 }
+      }
+    },
+    {
+      "id": "wf7-db-published",
+      "name": "DB: reel_status = published",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2750, 600],
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images?id=eq.{{ $('Prepara URL Pubblico').item.json.image_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={ \"reel_status\": \"published\", \"reel_published_at\": {{ JSON.stringify(new Date().toISOString()) }} }",
+        "options": { "timeout": 10000 }
+      }
+    },
+    {
+      "id": "wf7-notifica-ok",
+      "name": "Telegram — Reel Pronto ✅",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [3000, 600],
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "=🎬 *Reel pubblicato!*\n\nPersonaggio: {{ $('Prepara URL Pubblico').item.json.character_name }}\nProvider: {{ $('Prepara URL Pubblico').item.json.provider }}\nPiattaforme: {{ $('Prepara URL Pubblico').item.json.publish_ig ? 'Instagram ✓' : '' }} {{ $('Prepara URL Pubblico').item.json.publish_tiktok ? 'TikTok ✓' : '' }}\n\n{{ $('Prepara URL Pubblico').item.json.caption_base }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      }
+    },
+    {
+      "id": "wf7-db-failed",
+      "name": "DB: reel_status = failed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1000, 850],
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images?reel_task_id=eq.{{ $('Verifica Callback').item.json.task_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={ \"reel_status\": \"failed\", \"error_message\": {{ JSON.stringify($('Verifica Callback').item.json.error_msg) }} }",
+        "options": { "timeout": 10000 }
+      }
+    },
+    {
+      "id": "wf7-notifica-fail",
+      "name": "Telegram — Reel Fallito ❌",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1250, 850],
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "=❌ *Reel fallito*\n\nTask ID: {{ $('Verifica Callback').item.json.task_id }}\nErrore: {{ $('Verifica Callback').item.json.error_msg }}\n\nIl record è stato marcato come `failed`. Puoi reimpostare `reel_status = pending` da Supabase per ritentare.",
+        "additionalFields": { "parse_mode": "Markdown" }
+      }
+    },
+    {
+      "id": "wf7-risposta-webhook",
+      "name": "Risposta Webhook (200 OK)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1500, 850],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"received\": true }",
+        "options": { "responseCode": 200 }
+      }
+    },
+    {
+      "id": "wf7-nessun-reel",
+      "name": "Nessun Reel in Coda",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [750, 450],
+      "parameters": {},
+      "notes": "Coda vuota — il workflow termina silenziosamente. Ritenta al prossimo ciclo (15 min)."
+    }
+  ],
+  "connections": {
+    "Trigger Reel (Ogni 15 min)": {
+      "main": [[ { "node": "Carica Reel in Coda", "type": "main", "index": 0 } ]]
+    },
+    "Carica Reel in Coda": {
+      "main": [[ { "node": "Ci sono Reel?", "type": "main", "index": 0 } ]]
+    },
+    "Ci sono Reel?": {
+      "main": [
+        [ { "node": "Splitta Reel", "type": "main", "index": 0 } ],
+        [ { "node": "Nessun Reel in Coda", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Splitta Reel": {
+      "main": [[ { "node": "Claim Slot (Atomico)", "type": "main", "index": 0 } ]]
+    },
+    "Claim Slot (Atomico)": {
+      "main": [[ { "node": "Slot Disponibile?", "type": "main", "index": 0 } ]]
+    },
+    "Slot Disponibile?": {
+      "main": [
+        [ { "node": "Scegli Clip dalla Libreria", "type": "main", "index": 0 } ],
+        [ { "node": "Skip — Throttled", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Scegli Clip dalla Libreria": {
+      "main": [[ { "node": "Clip Trovato?", "type": "main", "index": 0 } ]]
+    },
+    "Clip Trovato?": {
+      "main": [
+        [ { "node": "Prepara Dati per Claude", "type": "main", "index": 0 } ],
+        [ { "node": "Errore — Nessun Clip in Libreria", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Prepara Dati per Claude": {
+      "main": [[ { "node": "Claude — Genera Reel Prompt", "type": "main", "index": 0 } ]]
+    },
+    "Claude — Genera Reel Prompt": {
+      "main": [[ { "node": "Estrai Prompt V2V", "type": "main", "index": 0 } ]]
+    },
+    "Estrai Prompt V2V": {
+      "main": [[ { "node": "Sceglie Provider", "type": "main", "index": 0 } ]]
+    },
+    "Sceglie Provider": {
+      "main": [
+        [ { "node": "Kling v1.6 — V2V Async", "type": "main", "index": 0 } ],
+        [ { "node": "Runway Gen-3 — V2V Async", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Kling v1.6 — V2V Async": {
+      "main": [[ { "node": "Normalizza Risposta Provider", "type": "main", "index": 0 } ]]
+    },
+    "Runway Gen-3 — V2V Async": {
+      "main": [[ { "node": "Normalizza Risposta Provider", "type": "main", "index": 0 } ]]
+    },
+    "Normalizza Risposta Provider": {
+      "main": [[ { "node": "DB: reel_status = generating", "type": "main", "index": 0 } ]]
+    },
+    "DB: reel_status = generating": {
+      "main": [[ { "node": "DB: Log Costo V2V", "type": "main", "index": 0 } ]]
+    },
+    "Webhook — Callback V2V": {
+      "main": [[ { "node": "Verifica Callback", "type": "main", "index": 0 } ]]
+    },
+    "Verifica Callback": {
+      "main": [[ { "node": "Trova Record per Task ID", "type": "main", "index": 0 } ]]
+    },
+    "Trova Record per Task ID": {
+      "main": [[ { "node": "Video OK?", "type": "main", "index": 0 } ]]
+    },
+    "Video OK?": {
+      "main": [
+        [ { "node": "Scarica Video da Provider", "type": "main", "index": 0 } ],
+        [ { "node": "DB: reel_status = failed", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Scarica Video da Provider": {
+      "main": [[ { "node": "Upload Reel su Supabase Storage", "type": "main", "index": 0 } ]]
+    },
+    "Upload Reel su Supabase Storage": {
+      "main": [[ { "node": "Prepara URL Pubblico", "type": "main", "index": 0 } ]]
+    },
+    "Prepara URL Pubblico": {
+      "main": [[ { "node": "DB: reel_status = completed", "type": "main", "index": 0 } ]]
+    },
+    "DB: reel_status = completed": {
+      "main": [[ { "node": "Instagram — Pubblica Reel", "type": "main", "index": 0 } ]]
+    },
+    "Instagram — Pubblica Reel": {
+      "main": [[ { "node": "Attendi 10s (IG Processing)", "type": "main", "index": 0 } ]]
+    },
+    "Attendi 10s (IG Processing)": {
+      "main": [[ { "node": "Instagram — Publish Reel", "type": "main", "index": 0 } ]]
+    },
+    "Instagram — Publish Reel": {
+      "main": [[ { "node": "DB: reel_status = published", "type": "main", "index": 0 } ]]
+    },
+    "DB: reel_status = published": {
+      "main": [[ { "node": "Telegram — Reel Pronto ✅", "type": "main", "index": 0 } ]]
+    },
+    "DB: reel_status = failed": {
+      "main": [[ { "node": "Telegram — Reel Fallito ❌", "type": "main", "index": 0 } ]]
+    },
+    "Telegram — Reel Fallito ❌": {
+      "main": [[ { "node": "Risposta Webhook (200 OK)", "type": "main", "index": 0 } ]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": ""
+  },
+  "tags": [
+    { "name": "reel" },
+    { "name": "video" },
+    { "name": "v2v" },
+    { "name": "tiktok" }
+  ],
+  "notes": "WORKFLOW 7: Pipeline Reel V2V. Prende immagini approvate con reel_status=pending, sceglie un clip dalla motion_library, genera il V2V con Kling o Runway, e pubblica su Instagram Reels. Prerequisiti: migration_v7_reel_pipeline.sql eseguita, bucket motion-library popolato con i tuoi clip, variabili env: KLING_API_KEY o RUNWAY_API_KEY, N8N_WEBHOOK_BASE_URL, REEL_PROVIDER (default: kling)."
+}

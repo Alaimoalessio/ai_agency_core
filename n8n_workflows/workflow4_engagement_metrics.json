@@ -1,0 +1,254 @@
+{
+  "name": "Workflow 4 — Raccolta Engagement Metrics",
+  "nodes": [
+    {
+      "id": "wf4-trigger",
+      "name": "Trigger Ogni 24h (10:00)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [0, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "0 10 * * *" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "wf4-carica-post",
+      "name": "Carica Post da Raccogliere",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [250, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}" }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "select", "value": "id,short_id,instagram_post_id,character_id,content_pillar,caption,scheduled_for,created_at,characters(instagram_account_id,instagram_access_token_enc,name)" },
+            { "name": "status", "value": "eq.published" },
+            { "name": "instagram_post_id", "value": "not.is.null" },
+            { "name": "created_at", "value": "gte.{{ new Date(Date.now() - 8*24*60*60*1000).toISOString() }}" },
+            { "name": "limit", "value": "50" }
+          ]
+        },
+        "options": { "timeout": 15000 }
+      }
+    },
+    {
+      "id": "wf4-ci-sono",
+      "name": "Ci sono post?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-posts",
+              "leftValue": "={{ $json.length }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "wf4-splitta",
+      "name": "Splitta Post",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [750, 250],
+      "parameters": {
+        "batchSize": 1,
+        "options": { "reset": false }
+      }
+    },
+    {
+      "id": "wf4-decrypt-token",
+      "name": "Recupera Token Decifrato",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1000, 250],
+      "notes": "Chiama la funzione Postgres decrypt_ig_token() via RPC. Il token non viaggia mai in chiaro nel DB.",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/rpc/decrypt_ig_token",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={ \"char_id\": {{ JSON.stringify($json.character_id) }} }",
+        "options": { "timeout": 10000 }
+      }
+    },
+    {
+      "id": "wf4-prepara-token",
+      "name": "Prepara Dati con Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 250],
+      "parameters": {
+        "jsCode": "const tokenResponse = $input.item.json;\nconst post = $('Splitta Post').item.json;\n\nconst accessToken = typeof tokenResponse === 'string'\n  ? tokenResponse  // RPC ritorna stringa diretta\n  : tokenResponse?.decrypt_ig_token || tokenResponse;\n\nif (!accessToken) {\n  throw new Error(`Token IG non trovato per character_id=${post.character_id}`);\n}\n\n// Determina tipo snapshot basandosi sull'età del post\nconst postAge = (Date.now() - new Date(post.created_at).getTime()) / (1000 * 60 * 60); // ore\nconst snapshotType = postAge < 30 ? '24h' : postAge < 8 * 24 ? '7d' : '30d';\n\nreturn {\n  ...post,\n  access_token: accessToken,\n  snapshot_type: snapshotType,\n  posted_hour: post.scheduled_for\n    ? new Date(post.scheduled_for).getHours()\n    : new Date(post.created_at).getHours(),\n  posted_dow: post.scheduled_for\n    ? new Date(post.scheduled_for).getDay()\n    : new Date(post.created_at).getDay()\n};"
+      }
+    },
+    {
+      "id": "wf4-ig-insights",
+      "name": "IG Graph API — Insights",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1500, 250],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.instagram_post_id }}/insights",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "metric", "value": "likes,comments,shares,saved,reach,impressions,profile_visits" },
+            { "name": "access_token", "value": "={{ $json.access_token }}" }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": { "response": { "fullResponse": false } }
+        }
+      }
+    },
+    {
+      "id": "wf4-elabora-insights",
+      "name": "Elabora Insights",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1750, 250],
+      "parameters": {
+        "jsCode": "const igResponse = $input.item.json;\nconst prev = $('Prepara Dati con Token').item.json;\n\n// Parsa metriche da IG Graph API response\nconst metrics = {};\nconst data = igResponse.data || [];\nfor (const metric of data) {\n  metrics[metric.name] = metric.values?.[0]?.value || metric.value || 0;\n}\n\nconst likes        = metrics.likes || 0;\nconst comments     = metrics.comments || 0;\nconst shares       = metrics.shares || 0;\nconst saves        = metrics.saved || 0;\nconst reach        = metrics.reach || 0;\nconst impressions  = metrics.impressions || 0;\nconst profileVisits = metrics.profile_visits || 0;\n\nreturn {\n  ...prev,\n  metrics: {\n    likes, comments, shares, saves, reach, impressions,\n    profile_visits: profileVisits,\n    caption_length: (prev.caption || '').length\n  }\n};"
+      }
+    },
+    {
+      "id": "wf4-salva-metrics",
+      "name": "DB: Salva Engagement Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2000, 250],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/engagement_metrics",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_ANON_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"image_id\": {{ JSON.stringify($json.id) }},\n  \"character_id\": {{ JSON.stringify($json.character_id) }},\n  \"instagram_post_id\": {{ JSON.stringify($json.instagram_post_id) }},\n  \"snapshot_type\": {{ JSON.stringify($json.snapshot_type) }},\n  \"likes\": {{ $json.metrics.likes }},\n  \"comments\": {{ $json.metrics.comments }},\n  \"saves\": {{ $json.metrics.saves }},\n  \"shares\": {{ $json.metrics.shares }},\n  \"reach\": {{ $json.metrics.reach }},\n  \"impressions\": {{ $json.metrics.impressions }},\n  \"profile_visits\": {{ $json.metrics.profile_visits }},\n  \"content_pillar\": {{ JSON.stringify($json.content_pillar) }},\n  \"caption_length\": {{ $json.metrics.caption_length }},\n  \"posted_hour\": {{ $json.posted_hour }},\n  \"posted_dow\": {{ $json.posted_dow }}\n}",
+        "options": { "timeout": 10000 }
+      }
+    },
+    {
+      "id": "wf4-loop-back",
+      "name": "Prossimo post",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2250, 250],
+      "parameters": {}
+    },
+    {
+      "id": "wf4-summary",
+      "name": "Summary Finale",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2500, 250],
+      "parameters": {
+        "jsCode": "// Questo nodo viene eseguito dopo che tutti i post sono stati processati\n// Aggrega i risultati per la notifica Telegram\nconst items = $input.all();\nreturn [{\n  processed: items.length,\n  message: `📊 Engagement raccolto per ${items.length} post.\\nQuery analytics: SELECT * FROM analytics_best_slots;`\n}];"
+      }
+    },
+    {
+      "id": "wf4-notifica",
+      "name": "Notifica Admin",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [2750, 300],
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "=📊 *Raccolta Engagement Completata*\n\nPost processati: {{ $json.processed }}\n\n{{ $json.message }}\n\nControlla `analytics_best_slots` su Supabase per ottimizzare orari e pillar.",
+        "additionalFields": { "parse_mode": "Markdown" }
+      }
+    },
+    {
+      "id": "wf4-no-post",
+      "name": "Nessun Post da Raccogliere",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [750, 450],
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "ℹ️ Engagement cron: nessun post nelle ultime 8 giorni da raccogliere.",
+        "additionalFields": {}
+      }
+    }
+  ],
+  "connections": {
+    "Trigger Ogni 24h (10:00)": {
+      "main": [[ { "node": "Carica Post da Raccogliere", "type": "main", "index": 0 } ]]
+    },
+    "Carica Post da Raccogliere": {
+      "main": [[ { "node": "Ci sono post?", "type": "main", "index": 0 } ]]
+    },
+    "Ci sono post?": {
+      "main": [
+        [ { "node": "Splitta Post", "type": "main", "index": 0 } ],
+        [ { "node": "Nessun Post da Raccogliere", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Splitta Post": {
+      "main": [[ { "node": "Recupera Token Decifrato", "type": "main", "index": 0 } ]]
+    },
+    "Recupera Token Decifrato": {
+      "main": [[ { "node": "Prepara Dati con Token", "type": "main", "index": 0 } ]]
+    },
+    "Prepara Dati con Token": {
+      "main": [[ { "node": "IG Graph API — Insights", "type": "main", "index": 0 } ]]
+    },
+    "IG Graph API — Insights": {
+      "main": [[ { "node": "Elabora Insights", "type": "main", "index": 0 } ]]
+    },
+    "Elabora Insights": {
+      "main": [[ { "node": "DB: Salva Engagement Metrics", "type": "main", "index": 0 } ]]
+    },
+    "DB: Salva Engagement Metrics": {
+      "main": [[ { "node": "Prossimo post", "type": "main", "index": 0 } ]]
+    },
+    "Prossimo post": {
+      "main": [[ { "node": "Summary Finale", "type": "main", "index": 0 } ]]
+    },
+    "Summary Finale": {
+      "main": [[ { "node": "Notifica Admin", "type": "main", "index": 0 } ]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [{ "name": "analytics" }, { "name": "instagram" }],
+  "notes": "WORKFLOW 4: Raccoglie engagement metrics da IG Graph API per ogni post pubblicato. Schedulato ogni 24h. Alimenta la view analytics_best_slots per ottimizzare orari e content pillar. Prerequisito: migration_v4_fixes.sql eseguita (tabella engagement_metrics)."
+}

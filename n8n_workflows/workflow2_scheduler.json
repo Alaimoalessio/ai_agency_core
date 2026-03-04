@@ -1,0 +1,681 @@
+{
+  "name": "Workflow 2 — Scheduler Calendario Editoriale",
+  "nodes": [
+
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 7 * * *" }]
+        }
+      },
+      "id": "node-schedule",
+      "name": "Trigger Giornaliero (07:00)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/calendar_today",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" }
+        ]},
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-fetch-today",
+      "name": "Carica Scene di Oggi",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300]
+    },
+
+    {
+      "parameters": {
+        "conditions": { "conditions": [{ "id": "cond-has-scenes", "leftValue": "={{ $json.length }}", "rightValue": 0, "operator": { "type": "number", "operation": "gt" } }], "combinator": "and" }
+      },
+      "id": "node-has-scenes",
+      "name": "Ci sono scene?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Splitta l'array di scene in items separati per il loop\nconst scenes = $input.item.json;\nif (!Array.isArray(scenes)) return [];\nreturn scenes.map(scene => ({ json: scene }));"
+      },
+      "id": "node-split-scenes",
+      "name": "Splitta Scene",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 220]
+    },
+
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/editorial_calendar",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "id", "value": "=eq.{{ $json.calendar_id }}" }] },
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\"status\": \"generating\"}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-mark-generating",
+      "name": "DB: Segna in Generazione",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 220]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" },
+          { "name": "Prefer", "value": "return=representation" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"character_id\": \"{{ $('Splitta Scene').item.json.character_id }}\",\n  \"user_request\": {{ JSON.stringify($('Splitta Scene').item.json.scene_description) }},\n  \"status\": \"generating\",\n  \"lora_scale\": {{ $('Splitta Scene').item.json.lora_scale }},\n  \"content_pillar\": {{ JSON.stringify($('Splitta Scene').item.json.content_pillar || 'lifestyle') }},\n  \"scheduled_for\": {{ JSON.stringify($('Splitta Scene').item.json.scheduled_for) }},\n  \"calendar_entry_id\": {{ JSON.stringify($('Splitta Scene').item.json.calendar_id) }},\n  \"attempts\": 1\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-create-image-record",
+      "name": "DB: Crea Record Immagine",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 220]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const dbResponse = $input.item.json;\nconst scene = $('Splitta Scene').item.json;\nconst record = Array.isArray(dbResponse) ? dbResponse[0] : dbResponse;\n\n// Costruisce il character sheet per questa scena\nconst characterSheet = [\n  `${scene.trigger_word} woman`,\n  scene.age || '',\n  scene.ethnicity || '',\n  scene.hair || '',\n  scene.eyes || '',\n  scene.body || '',\n  scene.style || '',\n  scene.distinctive || '',\n  'consistent appearance',\n  'same person'\n].filter(Boolean).join(', ');\n\nreturn {\n  image_id: record.id,\n  short_id: record.short_id,\n  calendar_id: scene.calendar_id,\n  character_id: scene.character_id,\n  character_name: scene.character_name,\n  character_sheet: characterSheet,\n  trigger_word: scene.trigger_word,\n  lora_version: scene.lora_version,\n  lora_scale: scene.lora_scale,\n  content_pillars: [],\n  content_pillar: scene.content_pillar || 'lifestyle',\n  user_request: scene.scene_description,\n  caption_hint: scene.caption_hint || '',\n  watermark_text: scene.watermark_text || '',\n  instagram_account_id: scene.instagram_account_id || '',\n  default_caption_template: scene.default_caption_template || '',\n  hashtags: scene.hashtags || [],\n  auto_publish: scene.auto_publish !== false,\n  generation_start: Date.now(),\n  attempt: 1\n};"
+      },
+      "id": "node-prepare-generation",
+      "name": "Prepara Dati Generazione",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 220]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{ $env.OPENROUTER_API_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"anthropic/claude-sonnet-4-5\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are an expert prompt engineer for FLUX image generation with LoRA fine-tuned models. Respond ONLY with raw JSON: {\\\"prompt\\\":\\\"...\\\",\\\"negative_prompt\\\":\\\"...\\\",\\\"pillar\\\":\\\"...\\\"}\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Character (VERBATIM first): {{ $json.character_sheet }}\\n\\nContent pillar: {{ $json.content_pillar }}\\nScene: {{ $json.user_request.replace(/\\\"/g, '\\\\\\\"') }}\\n\\nQuality tags required: photorealistic, 8k uhd, professional photography, sharp focus, cinematic lighting, shot on Sony A7IV.\\nNEVER alter character traits. NEVER add people unless asked.\"\n    }\n  ],\n  \"temperature\": 0.4,\n  \"max_tokens\": 1024\n}",
+        "options": { "timeout": 60000 }
+      },
+      "id": "node-claude-prompt",
+      "name": "Claude — Ottimizza Prompt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 220]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const response = $input.item.json;\nconst prev = $('Prepara Dati Generazione').item.json;\nif (!response.choices?.[0]) throw new Error('Claude error');\nconst raw = response.choices[0].message.content;\nconst cleaned = raw.replace(/```json\\s*/gi,'').replace(/```\\s*/g,'').trim();\nconst match = cleaned.match(/\\{[\\s\\S]*\\}/);\nconst DEFAULT_NEG = 'different person, inconsistent face, bad anatomy, bad hands, text, watermark, blurry, deformed, ugly, mutation, extra limbs, low quality';\nlet parsed;\ntry { parsed = JSON.parse(match ? match[0] : cleaned); } catch(e) { parsed = { prompt: cleaned, negative_prompt: DEFAULT_NEG, pillar: prev.content_pillar }; }\nlet prompt = (parsed.prompt || '').trim();\nif (!prompt.toLowerCase().includes(prev.trigger_word.toLowerCase())) prompt = `${prev.trigger_word} woman, ${prompt}`;\nreturn { ...prev, prompt, negative_prompt: (parsed.negative_prompt || DEFAULT_NEG).trim() };"
+      },
+      "id": "node-parse-prompt",
+      "name": "Elabora Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 220]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.replicate.com/v1/predictions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Token {{ $env.REPLICATE_API_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" },
+          { "name": "Prefer", "value": "wait" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"version\": {{ JSON.stringify($json.lora_version) }},\n  \"input\": {\n    \"prompt\": {{ JSON.stringify($json.prompt) }},\n    \"negative_prompt\": {{ JSON.stringify($json.negative_prompt) }},\n    \"width\": 1024,\n    \"height\": 1280,\n    \"num_inference_steps\": 40,\n    \"guidance_scale\": 3.2,\n    \"lora_scale\": {{ $json.lora_scale }},\n    \"num_outputs\": 1,\n    \"output_format\": \"jpeg\",\n    \"output_quality\": 90\n  }\n}",
+        "options": { "timeout": 180000 }
+      },
+      "id": "node-flux",
+      "name": "FLUX + LoRA — Genera Immagine",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2220, 220]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const rep = $input.item.json;\nconst prev = $('Elabora Prompt').item.json;\nlet imageUrl = rep.output ? (Array.isArray(rep.output) ? rep.output[0] : rep.output) : null;\nif (!imageUrl) throw new Error('Nessuna immagine: ' + (rep.error||'unknown'));\nreturn { ...prev, image_url: imageUrl, generation_time_ms: Date.now() - prev.generation_start };"
+      },
+      "id": "node-extract-url",
+      "name": "Estrai URL Immagine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 220]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{ $env.OPENROUTER_API_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"anthropic/claude-opus-4-6\",\n  \"messages\": [{\n    \"role\": \"user\",\n    \"content\": [\n      { \"type\": \"image\", \"source\": { \"type\": \"url\", \"url\": {{ JSON.stringify($json.image_url) }} } },\n      { \"type\": \"text\", \"text\": \"Quality control for AI social media image. Check: face clarity, hand anatomy, body proportions, focus sharpness, composition, AI artifacts. Score 0-100. Respond ONLY raw JSON: {\\\"pass\\\":true/false,\\\"score\\\":0-100,\\\"issues\\\":[],\\\"verdict\\\":\\\"one line\\\"}. Fail if score < 70.\" }\n    ]\n  }],\n  \"max_tokens\": 256\n}",
+        "options": { "timeout": 60000 }
+      },
+      "id": "node-quality-check",
+      "name": "Claude Vision — Valida Qualità",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2660, 220]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const vr = $input.item.json;\nconst prev = $('Estrai URL Immagine').item.json;\nif (!vr.choices?.[0]) return { ...prev, quality_pass: true, quality_score: null, quality_issues: [] };\nconst raw = vr.choices[0].message.content.replace(/```json\\s*/gi,'').replace(/```\\s*/g,'').trim();\nconst match = raw.match(/\\{[\\s\\S]*\\}/);\nlet qc;\ntry { qc = JSON.parse(match ? match[0] : raw); } catch(e) { return { ...prev, quality_pass: true, quality_score: null, quality_issues: [] }; }\nreturn { ...prev, quality_pass: qc.pass === true && (qc.score||0) >= 70, quality_score: qc.score||0, quality_issues: qc.issues||[], quality_verdict: qc.verdict||'' };"
+      },
+      "id": "node-quality-parser",
+      "name": "Elabora Qualità",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2880, 220]
+    },
+
+    {
+      "parameters": {
+        "conditions": { "conditions": [{ "id": "cond-q", "leftValue": "={{ $json.quality_pass }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }], "combinator": "and" }
+      },
+      "id": "node-quality-gate",
+      "name": "Qualità OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3100, 220]
+    },
+
+    {
+      "parameters": {
+        "conditions": { "conditions": [{ "id": "cond-retry", "leftValue": "={{ $json.attempt }}", "rightValue": 2, "operator": { "type": "number", "operation": "lt" } }], "combinator": "and" }
+      },
+      "id": "node-retry-check",
+      "name": "Tentativi < 2?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3320, 360]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "return { ...$input.item.json, attempt: ($input.item.json.attempt||1) + 1, generation_start: Date.now() };"
+      },
+      "id": "node-retry-prep",
+      "name": "Prepara Retry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3540, 300]
+    },
+
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/editorial_calendar",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "id", "value": "=eq.{{ $json.calendar_id }}" }] },
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\"status\": \"skipped\", \"error_message\": {{ JSON.stringify('Quality fail dopo 2 tentativi: ' + ($json.quality_verdict||'')) }}}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-mark-skipped",
+      "name": "DB: Segna Saltata",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3540, 440]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// ================================================================\n// GENERAZIONE CAPTION con Claude\n// Usa il template del personaggio + hint specifico della scena\n// ================================================================\nconst prev = $input.item.json;\n\nconst template = prev.default_caption_template || 'Living the moment ✨\\n\\n{scene}';\nconst hashtags = (prev.hashtags || []).join(' ');\n\n// Se non c'è template né caption_hint, usa descrizione scena semplice\nconst captionHint = prev.caption_hint || prev.user_request;\n\nreturn {\n  ...prev,\n  caption_prompt: `Create an engaging Instagram caption for this scene: \"${captionHint}\"\\nCaption template/style: \"${template}\"\\nHashtags to append: ${hashtags}\\n\\nRules: max 150 chars before hashtags, use emojis naturally, match the content pillar \"${prev.content_pillar}\". Respond with ONLY the caption text including hashtags.`\n};"
+      },
+      "id": "node-caption-prep",
+      "name": "Prepara Caption",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3320, 140]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{ $env.OPENROUTER_API_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"anthropic/claude-sonnet-4-5\",\n  \"messages\": [{ \"role\": \"user\", \"content\": {{ JSON.stringify($json.caption_prompt) }} }],\n  \"temperature\": 0.7,\n  \"max_tokens\": 300\n}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "node-claude-caption",
+      "name": "Claude — Genera Caption",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3540, 140]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const captionResponse = $input.item.json;\nconst prev = $('Prepara Caption').item.json;\nconst caption = captionResponse.choices?.[0]?.message?.content?.trim() || prev.caption_hint || prev.user_request;\nreturn { ...prev, caption };"
+      },
+      "id": "node-extract-caption",
+      "name": "Estrai Caption",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3760, 140]
+    },
+
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "id", "value": "=eq.{{ $json.image_id }}" }] },
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"status\": \"approved\",\n  \"image_url\": {{ JSON.stringify($json.image_url) }},\n  \"prompt\": {{ JSON.stringify($json.prompt) }},\n  \"negative_prompt\": {{ JSON.stringify($json.negative_prompt) }},\n  \"content_pillar\": {{ JSON.stringify($json.content_pillar) }},\n  \"quality_score\": {{ $json.quality_score || 0 }},\n  \"quality_issues\": {{ JSON.stringify($json.quality_issues || []) }},\n  \"generation_time_ms\": {{ $json.generation_time_ms }},\n  \"caption\": {{ JSON.stringify($json.caption) }},\n  \"attempts\": {{ $json.attempt || 1 }}\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-db-approved",
+      "name": "DB: Segna Approvata",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3980, 140]
+    },
+
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/editorial_calendar",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "id", "value": "=eq.{{ $json.calendar_id }}" }] },
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\"status\": \"ready\", \"image_id\": {{ JSON.stringify($json.image_id) }}}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-calendar-ready",
+      "name": "DB: Calendario → ready",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4200, 140]
+    },
+
+    {
+      "parameters": {
+        "conditions": { "conditions": [{ "id": "cond-autopub", "leftValue": "={{ $('Estrai Caption').item.json.auto_publish }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }], "combinator": "and" }
+      },
+      "id": "node-autopub-check",
+      "name": "Auto-pubblica?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [4420, 140]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// ================================================================\n// WATERMARK via Supabase Edge Function o servizio esterno\n//\n// OPZIONE A (consigliata): Usa una Supabase Edge Function\n// che riceve l'URL dell'immagine, aggiunge il watermark con Sharp,\n// e salva il risultato su Supabase Storage.\n//\n// OPZIONE B: Usa bannerbear.com API (servizio SaaS)\n//\n// OPZIONE C: Script Python su VPS con Pillow\n//\n// Questo nodo prepara i dati per qualsiasi delle opzioni sopra.\n// Il nodo successivo chiama l'endpoint scelto.\n// ================================================================\nconst prev = $('Estrai Caption').item.json;\n\nreturn {\n  ...prev,\n  watermark_payload: {\n    image_url: prev.image_url,\n    watermark_text: prev.watermark_text || '@profilo.ai',\n    position: 'bottom-right',\n    font_size: 28,\n    opacity: 0.75,\n    output_filename: `wm_${prev.short_id}.jpg`\n  }\n};"
+      },
+      "id": "node-watermark-prep",
+      "name": "Prepara Watermark",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4640, 80]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/functions/v1/add-watermark",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.watermark_payload) }}",
+        "options": { "timeout": 60000 }
+      },
+      "id": "node-watermark-call",
+      "name": "Applica Watermark",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4860, 80]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const wmResponse = $input.item.json;\nconst prev = $('Prepara Watermark').item.json;\n\n// L'edge function ritorna { public_url: '...', storage_path: '...' }\nconst watermarkedUrl = wmResponse.public_url || wmResponse.url || prev.image_url;\n\nreturn { ...prev, watermarked_url: watermarkedUrl };"
+      },
+      "id": "node-watermark-extract",
+      "name": "Estrai URL Watermark",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [5080, 80]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.instagram_account_id }}/media",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"image_url\": {{ JSON.stringify($json.watermarked_url || $json.image_url) }},\n  \"caption\": {{ JSON.stringify($json.caption) }},\n  \"access_token\": {{ JSON.stringify($json.instagram_access_token) }}\n}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "node-ig-upload",
+      "name": "Instagram — Carica Media",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [5300, 80]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const igResponse = $input.item.json;\nconst prev = $('Estrai URL Watermark').item.json;\nif (!igResponse.id) throw new Error('Instagram upload fallito: ' + JSON.stringify(igResponse));\nreturn { ...prev, ig_creation_id: igResponse.id };"
+      },
+      "id": "node-ig-creation-id",
+      "name": "Estrai Creation ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [5520, 80]
+    },
+
+    {
+      "parameters": {
+        "amount": 5,
+        "unit": "seconds"
+      },
+      "id": "node-wait",
+      "name": "Attendi 5s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [5740, 80]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $('Estrai Caption').item.json.instagram_account_id }}/media_publish",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"creation_id\": {{ JSON.stringify($json.ig_creation_id) }},\n  \"access_token\": {{ JSON.stringify($('Estrai Caption').item.json.instagram_access_token) }}\n}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "node-ig-publish",
+      "name": "Instagram — Pubblica Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [5960, 80]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const pubResponse = $input.item.json;\nconst prev = $('Estrai Caption').item.json;\nif (!pubResponse.id) throw new Error('Publish fallito: ' + JSON.stringify(pubResponse));\nconst postUrl = `https://www.instagram.com/p/${pubResponse.id}/`;\nreturn { ...prev, instagram_post_id: pubResponse.id, instagram_post_url: postUrl };"
+      },
+      "id": "node-pub-result",
+      "name": "Estrai Post ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [6180, 80]
+    },
+
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/images",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "id", "value": "=eq.{{ $json.image_id }}" }] },
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"status\": \"published\",\n  \"watermarked_url\": {{ JSON.stringify($json.watermarked_url || $json.image_url) }},\n  \"instagram_post_id\": {{ JSON.stringify($json.instagram_post_id) }},\n  \"instagram_post_url\": {{ JSON.stringify($json.instagram_post_url) }},\n  \"caption\": {{ JSON.stringify($json.caption) }},\n  \"published_at\": {{ JSON.stringify(new Date().toISOString()) }}\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-db-published",
+      "name": "DB: Segna Pubblicata",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [6400, 80]
+    },
+
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/editorial_calendar",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "id", "value": "=eq.{{ $('Estrai Caption').item.json.calendar_id }}" }] },
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\"status\": \"published\", \"published_at\": {{ JSON.stringify(new Date().toISOString()) }}}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-calendar-published",
+      "name": "DB: Calendario → published",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [6400, 200]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/publication_log",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"image_id\": {{ JSON.stringify($('Estrai Caption').item.json.image_id) }},\n  \"character_id\": {{ JSON.stringify($('Estrai Caption').item.json.character_id) }},\n  \"platform\": \"instagram\",\n  \"status\": \"success\",\n  \"post_id\": {{ JSON.stringify($('Estrai Post ID').item.json.instagram_post_id) }},\n  \"post_url\": {{ JSON.stringify($('Estrai Post ID').item.json.instagram_post_url) }},\n  \"caption_used\": {{ JSON.stringify($('Estrai Caption').item.json.caption) }}\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-log-success",
+      "name": "DB: Log Pubblicazione",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [6620, 80]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/publication_log",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={\n  \"image_id\": {{ JSON.stringify($('Estrai Caption').item.json.image_id) }},\n  \"character_id\": {{ JSON.stringify($('Estrai Caption').item.json.character_id) }},\n  \"platform\": \"instagram\",\n  \"status\": \"failed\",\n  \"error_message\": {{ JSON.stringify($input.item.json.message || 'Errore sconosciuto') }}\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-log-error",
+      "name": "DB: Log Errore Pubblicazione",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [5960, 280]
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $env.ADMIN_TELEGRAM_CHAT_ID }}",
+        "text": "=⚠️ Errore pubblicazione Instagram per {{ $('Estrai Caption').item.json.character_name }}.\n\nScena: {{ $('Estrai Caption').item.json.user_request }}\nErrore: {{ $input.item.json.message || 'sconosciuto' }}",
+        "additionalFields": {}
+      },
+      "id": "node-notify-error",
+      "name": "Notifica Admin — Errore",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [6180, 280],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $env.ADMIN_TELEGRAM_CHAT_ID }}",
+        "text": "=✅ Pubblicata! {{ $('Estrai Post ID').item.json.character_name }}\n\n🔗 {{ $('Estrai Post ID').item.json.instagram_post_url }}\n📝 {{ $('Estrai Caption').item.json.caption.substring(0, 100) }}...",
+        "additionalFields": {}
+      },
+      "id": "node-notify-success",
+      "name": "Notifica Admin — Successo",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [6840, 80],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $env.ADMIN_TELEGRAM_CHAT_ID }}",
+        "text": "📅 Nessuna scena pianificata per oggi nel calendario.",
+        "additionalFields": {}
+      },
+      "id": "node-no-scenes",
+      "name": "Notifica — Nessuna Scena",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [900, 420],
+      "credentials": { "telegramApi": { "id": "TELEGRAM_CREDENTIAL_ID", "name": "Telegram Bot" } }
+    }
+
+  ],
+
+  "connections": {
+    "Trigger Giornaliero (07:00)": { "main": [[{ "node": "Carica Scene di Oggi", "type": "main", "index": 0 }]] },
+    "Carica Scene di Oggi": { "main": [[{ "node": "Ci sono scene?", "type": "main", "index": 0 }]] },
+    "Ci sono scene?": {
+      "main": [
+        [{ "node": "Splitta Scene", "type": "main", "index": 0 }],
+        [{ "node": "Notifica — Nessuna Scena", "type": "main", "index": 0 }]
+      ]
+    },
+    "Splitta Scene": { "main": [[{ "node": "DB: Segna in Generazione", "type": "main", "index": 0 }]] },
+    "DB: Segna in Generazione": { "main": [[{ "node": "DB: Crea Record Immagine", "type": "main", "index": 0 }]] },
+    "DB: Crea Record Immagine": { "main": [[{ "node": "Prepara Dati Generazione", "type": "main", "index": 0 }]] },
+    "Prepara Dati Generazione": { "main": [[{ "node": "Claude — Ottimizza Prompt", "type": "main", "index": 0 }]] },
+    "Claude — Ottimizza Prompt": { "main": [[{ "node": "Elabora Prompt", "type": "main", "index": 0 }]] },
+    "Elabora Prompt": { "main": [[{ "node": "FLUX + LoRA — Genera Immagine", "type": "main", "index": 0 }]] },
+    "FLUX + LoRA — Genera Immagine": { "main": [[{ "node": "Estrai URL Immagine", "type": "main", "index": 0 }]] },
+    "Estrai URL Immagine": { "main": [[{ "node": "Claude Vision — Valida Qualità", "type": "main", "index": 0 }]] },
+    "Claude Vision — Valida Qualità": { "main": [[{ "node": "Elabora Qualità", "type": "main", "index": 0 }]] },
+    "Elabora Qualità": { "main": [[{ "node": "Qualità OK?", "type": "main", "index": 0 }]] },
+    "Qualità OK?": {
+      "main": [
+        [{ "node": "Prepara Caption", "type": "main", "index": 0 }],
+        [{ "node": "Tentativi < 2?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Tentativi < 2?": {
+      "main": [
+        [{ "node": "Prepara Retry", "type": "main", "index": 0 }],
+        [{ "node": "DB: Segna Saltata", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prepara Retry": { "main": [[{ "node": "FLUX + LoRA — Genera Immagine", "type": "main", "index": 0 }]] },
+    "Prepara Caption": { "main": [[{ "node": "Claude — Genera Caption", "type": "main", "index": 0 }]] },
+    "Claude — Genera Caption": { "main": [[{ "node": "Estrai Caption", "type": "main", "index": 0 }]] },
+    "Estrai Caption": { "main": [[{ "node": "DB: Segna Approvata", "type": "main", "index": 0 }]] },
+    "DB: Segna Approvata": { "main": [[{ "node": "DB: Calendario → ready", "type": "main", "index": 0 }]] },
+    "DB: Calendario → ready": { "main": [[{ "node": "Auto-pubblica?", "type": "main", "index": 0 }]] },
+    "Auto-pubblica?": {
+      "main": [
+        [{ "node": "Prepara Watermark", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Prepara Watermark": { "main": [[{ "node": "Applica Watermark", "type": "main", "index": 0 }]] },
+    "Applica Watermark": { "main": [[{ "node": "Estrai URL Watermark", "type": "main", "index": 0 }]] },
+    "Estrai URL Watermark": { "main": [[{ "node": "Instagram — Carica Media", "type": "main", "index": 0 }]] },
+    "Instagram — Carica Media": { "main": [[{ "node": "Estrai Creation ID", "type": "main", "index": 0 }]] },
+    "Estrai Creation ID": { "main": [[{ "node": "Attendi 5s", "type": "main", "index": 0 }]] },
+    "Attendi 5s": { "main": [[{ "node": "Instagram — Pubblica Post", "type": "main", "index": 0 }]] },
+    "Instagram — Pubblica Post": { "main": [[{ "node": "Estrai Post ID", "type": "main", "index": 0 }]] },
+    "Estrai Post ID": {
+      "main": [[
+        { "node": "DB: Segna Pubblicata", "type": "main", "index": 0 }
+      ]]
+    },
+    "DB: Segna Pubblicata": { "main": [[{ "node": "DB: Calendario → published", "type": "main", "index": 0 }]] },
+    "DB: Calendario → published": { "main": [[{ "node": "DB: Log Pubblicazione", "type": "main", "index": 0 }]] },
+    "DB: Log Pubblicazione": { "main": [[{ "node": "Notifica Admin — Successo", "type": "main", "index": 0 }]] }
+  },
+
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["scheduler", "calendar", "instagram", "watermark", "publication", "flux", "lora", "v3"],
+  "triggerCount": 0,
+  "updatedAt": "2026-02-27T00:00:00.000Z",
+  "versionId": "1"
+}
